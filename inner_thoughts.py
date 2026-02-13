@@ -26,7 +26,10 @@ class InnerThoughtsEngine:
     """
     
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        self.client = AsyncOpenAI(
+            base_url=config.LLM_BASE_URL,
+            api_key=config.OPENAI_API_KEY or "no-key"
+        )
     
     # =========================================================================
     # ステージ1: Trigger（トリガー検出）
@@ -168,24 +171,27 @@ class InnerThoughtsEngine:
         """
         自発的な発言を生成
         """
-        prompt = prompts.format_proactive_response_prompt(
+        system_prompt = prompts.format_proactive_system_prompt(
             thought=potential_response,
-            conversation_context=memory.get_context_summary(),
             user_memories=memory.get_all_memories_summary(),
             silence_duration=memory.get_silence_duration(),
             trigger_reason=trigger_reason
         )
-        
+
+        # 会話履歴をチャット形式で渡す（Litaの既発言を正しく認識させる）
+        messages = memory.get_conversation_history()
+
         try:
+            openai_messages = [{"role": "system", "content": system_prompt}] + messages
             response = await self.client.chat.completions.create(
                 model=config.LLM_MODEL,
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS,
-                messages=[{"role": "user", "content": prompt}]
+                messages=openai_messages
             )
-            
+
             content = response.choices[0].message.content
             return content.strip() if content else ""
-            
+
         except Exception as e:
             print(f"Proactive response error: {e}")
             return ""
@@ -193,25 +199,30 @@ class InnerThoughtsEngine:
     async def generate_silence_break(self, memory: MemoryManager) -> str:
         """
         沈黙を破る発言を生成
+
+        注意: 現在は未使用。沈黙タイムアウトも通常の思考生成→動機づけ評価パイプラインを
+        通すように変更したため、この専用メソッドは呼ばれない。
+        沈黙破り専用の生成ロジックが必要になった場合に備えて残している。
         """
-        last_conv = memory.get_context_summary()
-        
-        prompt = prompts.format_silence_break_prompt(
+        system_prompt = prompts.format_silence_break_system_prompt(
             user_memories=memory.get_all_memories_summary(),
-            last_conversation=last_conv,
             silence_duration=memory.get_silence_duration()
         )
-        
+
+        # 会話履歴をチャット形式で渡す
+        messages = memory.get_conversation_history()
+
         try:
+            openai_messages = [{"role": "system", "content": system_prompt}] + messages
             response = await self.client.chat.completions.create(
                 model=config.LLM_MODEL,
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS,
-                messages=[{"role": "user", "content": prompt}]
+                messages=openai_messages
             )
-            
+
             content = response.choices[0].message.content
             return content.strip() if content else ""
-            
+
         except Exception as e:
             print(f"Silence break error: {e}")
             return ""
@@ -295,36 +306,33 @@ class InnerThoughtsEngine:
     # メインの処理フロー
     # =========================================================================
     
-    async def process_proactive_cycle(self, memory: MemoryManager) -> Optional[str]:
+    async def process_proactive_cycle(self, memory: MemoryManager) -> Optional[dict]:
         """
         Proactiveサイクルの実行
-        
+
         Returns:
-            発言すべき内容、または None
+            {"response": str, "thought": dict, "evaluation": dict, "trigger": str}
+            または None
         """
         # 介入可能かチェック
         if not memory.can_intervene():
             return None
-        
+
         # トリガーチェック
         should_trigger, trigger_reason = self.should_trigger_thought(memory)
         if not should_trigger:
             return None
-        
-        # 沈黙タイムアウトの場合は特別処理
-        if "silence_timeout" in trigger_reason:
-            return await self.generate_silence_break(memory)
-        
+
         # 思考生成
         result = await self.generate_thought(memory, trigger_reason)
         if not result:
             return None
-        
+
         thought, potential_response = result
-        
+
         # 動機づけ評価
         evaluation = await self.evaluate_motivation(thought.content, memory)
-        
+
         # 思考をリザーバーに保存
         thought.motivation_score = evaluation.get("overall_score", 0)
         thought.reasoning = evaluation.get("reasoning", "")
@@ -334,8 +342,10 @@ class InnerThoughtsEngine:
             reasoning=thought.reasoning,
             triggered_by=trigger_reason
         )
-        
+
         # 閾値チェック
+        was_expressed = False
+        response = None
         if thought.motivation_score >= config.MOTIVATION_THRESHOLD:
             if evaluation.get("should_speak", False):
                 # 発言生成
@@ -344,9 +354,17 @@ class InnerThoughtsEngine:
                 )
                 if response:
                     thought.expressed = True
-                    return response
-        
-        return None
+                    was_expressed = True
+
+        # 思考データは発言の有無に関わらず返す（ログ用）
+        return {
+            "response": response,
+            "thought_content": thought.content,
+            "trigger_reason": trigger_reason,
+            "motivation_score": thought.motivation_score,
+            "evaluation": evaluation,
+            "was_expressed": was_expressed,
+        }
     
     # =========================================================================
     # ユーティリティ

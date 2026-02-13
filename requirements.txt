@@ -4,6 +4,10 @@
 # Discord
 discord.py>=2.3.0
 
+# Slack
+slack_bolt>=1.18.0
+slack_sdk>=3.27.0
+
 # LLM API
 openai>=1.0.0
 

@@ -43,7 +43,10 @@ class InformationGatherer:
     """
     
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        self.client = AsyncOpenAI(
+            base_url=config.LLM_BASE_URL,
+            api_key=config.OPENAI_API_KEY or "no-key"
+        )
         self.brave_api_key = config.BRAVE_SEARCH_API_KEY
         
         # ユーザーごとの記事キャッシュ（既に見つけた記事のURL）
