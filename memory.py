@@ -136,7 +136,7 @@ class MemoryManager:
         
         for msg in recent:
             role_name = "ユーザー" if msg.role == "user" else config.AI_NAME
-            summary_parts.append(f"{role_name}: {msg.content[:100]}...")
+            summary_parts.append(f"{role_name}: {msg.content[:200]}...")
         
         return "\n".join(summary_parts)
     
@@ -236,8 +236,15 @@ class MemoryManager:
     def get_pending_thoughts(self, min_score: float = 0) -> list[Thought]:
         """未発言の思考を取得"""
         return [
-            t for t in self.thought_reservoir 
+            t for t in self.thought_reservoir
             if not t.expressed and t.motivation_score >= min_score
+        ]
+
+    def get_expressed_thoughts(self) -> list[Thought]:
+        """発言済みの思考を取得"""
+        return [
+            t for t in self.thought_reservoir
+            if t.expressed
         ]
     
     def mark_thought_expressed(self, thought: Thought):

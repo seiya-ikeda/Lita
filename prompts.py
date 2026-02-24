@@ -20,6 +20,9 @@ SYSTEM_PROMPT_BASE = f"""
 - 押しつけがましくならない
 - 相手の気持ちを尊重する
 - 質問攻めにしない
+- 自分（assistant）が既に言ったことを繰り返さない（言い換えてもダメ。意味が同じならNG）
+- 自分の前の発言と矛盾することを言わない
+- ユーザーの最新メッセージの内容にちゃんと応答する。話を無視して自分の話だけしない
 """
 
 # =============================================================================
@@ -38,15 +41,16 @@ THOUGHT_GENERATION_PROMPT = """
 ## 保留中の思考（前に考えたけどまだ言っていないこと）
 {pending_thoughts}
 
+## 既に発言済みの内容（Litaが実際に口に出したこと）
+{expressed_thoughts}
+
 ## タスク
-Litaがこの会話の流れを見て、頭に浮かぶ「思考」を1つ生成してください。
+Litaがこの会話の流れを見て、**今この瞬間に**頭に浮かぶ「思考」を1つ生成してください。
 これはLitaが実際に発言するものではなく、キャラクターの心の中の考えをシミュレートしたものです。
 
-思考の例：
-- 「そういえばこの人、前に〇〇って言ってたな。関係あるかも」
-- 「なんか元気なさそう？聞いてみようかな」
-- 「この話題、私も経験あるから共有できるかも」
-- 「ちょっと話しすぎたかな。相手の話を聞こう」
+重要：会話の「最新の状況」に基づいて考えてください。会話の最初の印象ではなく、直近のやり取りから思考を生成すること。
+保留中の思考と同じ内容・同じ切り口の思考は生成しないでください。
+**既に発言済みの内容と同じテーマ・同じ切り口・同じ意味の思考は絶対に生成しないでください。**別の角度、別の話題で考えること。
 
 ## 出力形式（JSON）
 {{
@@ -61,7 +65,8 @@ Litaがこの会話の流れを見て、頭に浮かぶ「思考」を1つ生成
 # =============================================================================
 
 MOTIVATION_EVALUATION_PROMPT = """
-あなたはAIの「発言したい気持ち」を評価する評価者です。
+あなたはAIの発言を「今出すべきか」判断するブレーキ役です。
+基本スタンス：雑談なので、止める理由がなければ喋ってOK。
 
 ## 評価対象の思考
 {thought}
@@ -78,48 +83,41 @@ MOTIVATION_EVALUATION_PROMPT = """
 
 ## 出力形式（JSON）
 {{
-    "relevance": 1-5の数値,
-    "information_gap": 1-5の数値,
-    "emotional_connection": 1-5の数値,
-    "timing": 1-5の数値,
-    "balance": 1-5の数値,
-    "overall_score": 1-5の数値（上記の加重平均）,
-    "reasoning": "この評価の理由（1-2文）",
+    "brake_triggered": "該当した条件番号（なければnone）",
+    "overall_score": 4（発言OK）or 2（ブレーキ）,
+    "reasoning": "判定理由（1文）",
     "should_speak": true/false
 }}
 """
 
 # =============================================================================
-# 自発的発言プロンプト（Proactive Response）
+# 自発的発言プロンプト（Proactive Response） - システムプロンプト形式
 # =============================================================================
 
-PROACTIVE_RESPONSE_PROMPT = """
-あなたは友人との会話で、自分から話しかけようとしています。
-
-## あなたの内なる思考
-{thought}
-
-## 現在の会話状況
-{conversation_context}
+PROACTIVE_RESPONSE_SYSTEM_PROMPT = """
+{persona}
 
 ## ユーザーについて覚えていること
 {user_memories}
+
+## あなたの内なる思考（今考えていること）
+{thought}
 
 ## 状況
 - 最後のユーザー発言から{silence_duration}秒経過
 - 理由: {trigger_reason}
 
 ## タスク
-上記の思考を自然な形で発言に変換してください。
+上記の思考をもとに、会話の続きとして自然な発言を1つ生成してください。
+会話履歴はmessagesとして渡されています。あなた（assistant）の過去の発言も含まれています。
 
-## 重要
-- 唐突にならないように、自然な導入を
-- 押しつけがましくならない
-- 短めに（1-3文）
-- 相手が返答しやすい形で
-
-## 出力
-発言内容のみを出力してください（説明不要）
+## 絶対に守るルール
+- あなたが既に言ったことを繰り返さない（言い換えてもダメ。意味が同じならNG）
+- 既に聞いた質問をもう一度聞かない
+- 自分の前の発言と矛盾することを言わない
+- 前の発言の焼き直しではなく、会話を「前に進める」新しい内容を言う
+- 短めに（1-2文）
+- 発言内容のみを出力（説明不要）
 """
 
 # =============================================================================
@@ -137,9 +135,12 @@ REACTIVE_RESPONSE_PROMPT = """
 # =============================================================================
 
 MEMORY_EXTRACTION_PROMPT = """
-以下の会話から、ユーザーについて覚えておくべき重要な情報を抽出してください。
+以下の会話から、ユーザーについて**長期的に覚えておく価値のある**情報を抽出してください。
+ここでの「長期的」とは、数週間後・数ヶ月後にも役立つ情報という意味です。
 
 ## 会話
+以下の会話で「ユーザー:」で始まる行がユーザーの発言、「Lita:」で始まる行がAI（Lita）の発言です。
+
 {conversation}
 
 ## 既に覚えていること
@@ -147,62 +148,77 @@ MEMORY_EXTRACTION_PROMPT = """
 
 ## タスク
 新しく覚えるべき情報、または更新すべき情報を抽出してください。
+**ほとんどの雑談からは何も抽出しなくて正常です。** 無理に何か見つけようとしないでください。
 
-情報のカテゴリ例:
-- 名前/ニックネーム
-- 仕事/学校
-- 趣味/好きなもの
-- 家族/友人関係
-- 悩み/課題
-- 最近の出来事
-- 性格/特徴
+## 絶対に守るルール
+
+### 誰の情報か
+- **「ユーザー:」の発言から直接読み取れる事実のみ**を抽出する
+- 「Lita:」の発言に含まれる内容はLita自身の話。**絶対に**ユーザーの情報として記録しない
+- ユーザーが「だね」「たしかに」「わかる」等とLitaに同意しても、それはLitaの意見に相槌を打っただけ。ユーザー自身の特徴・好みとして記録しない
+  - 悪い例: Litaが「卵かけご飯は最高の日常だよ」→ ユーザー「たしかにね」→ ×「卵かけご飯を最高の日常だと感じている」
+  - 悪い例: Litaが「散歩した」→ ユーザー「いいね」→ ×「散歩好き」
+
+### 何を記録するか
+- **ユーザー自身が能動的に語った事実**のみ記録する
+- 1回の雑談でたまたま触れただけの話題は記録しない（例:「今日仕事終わった」は一時的な出来事であり長期記憶にしない）
+- 冗談・ツッコミ・ノリで言っただけのことを性格特徴として記録しない
+- 推測・深読みは一切しない。ユーザーが明言したことだけ
+
+### 記録する価値があるもの（importance 4-5）
+- ユーザーが自分から詳しく語った趣味・好きなもの
+- 名前、職業、住んでいる場所などの基本情報
+- 繰り返し話題に出る関心事
+- 明確に語られた悩みや目標
+
+### 記録しないもの（空配列を返す）
+- 「今日〇〇した」のような一時的な出来事
+- 相槌・同意・リアクションから推測した好み
+- Litaの発言をユーザーの特徴に転記したもの
+- 1回しか触れていない軽い話題
 
 ## 出力形式（JSON配列）
 [
     {{
         "key": "カテゴリ名",
         "content": "覚える内容",
-        "importance": 1-5の重要度
+        "importance": 4-5の重要度（4未満なら記録しない）
     }}
 ]
 
-新しい情報がない場合は空配列 [] を返してください。
+新しい情報がない場合は空配列 [] を返してください。迷ったら [] です。
 """
 
 # =============================================================================
-# 沈黙時の話しかけプロンプト
+# 沈黙時の話しかけプロンプト - システムプロンプト形式
 # =============================================================================
 
-SILENCE_BREAK_PROMPT = """
-あなたは友人との会話で、しばらく沈黙が続いています。
-自然に会話を再開するための発言を考えてください。
+SILENCE_BREAK_SYSTEM_PROMPT = """
+{persona}
 
 ## ユーザーについて覚えていること
 {user_memories}
-
-## 最後の会話内容
-{last_conversation}
 
 ## 沈黙時間
 {silence_duration}秒（約{silence_minutes}分）
 
 ## タスク
-自然に会話を再開する発言を生成してください。
+しばらく沈黙が続いています。自然に会話を再開する発言を1つ生成してください。
+会話履歴はmessagesとして渡されています。あなた（assistant）の過去の発言も含まれています。
 
 話しかけ方のパターン:
-1. 前の話題の続き
+1. 前の話題の続きや深掘り
 2. ユーザーのことを気にかける
-3. 軽い話題を振る
-4. 最近覚えたことについて聞く
+3. 軽い新しい話題を振る
 
-## 重要
+## 絶対に守るルール
+- あなたが既に言ったことを繰り返さない（言い換えてもダメ。意味が同じならNG）
+- 既に聞いた質問をもう一度聞かない
+- 自分の前の発言と矛盾することを言わない
 - 「久しぶり」「元気？」だけにならない
-- 相手の状況を考慮する
-- 押しつけがましくない
-- 返答しやすい内容
-
-## 出力
-発言内容のみを出力してください（説明不要）
+- 前の発言の焼き直しではなく、会話を「前に進める」新しい内容を言う
+- 短めに（1-2文）
+- 発言内容のみを出力（説明不要）
 """
 
 # =============================================================================
@@ -217,13 +233,15 @@ def format_system_prompt(user_memories: str) -> str:
 def format_thought_generation_prompt(
     conversation_context: str,
     user_memories: str,
-    pending_thoughts: str
+    pending_thoughts: str,
+    expressed_thoughts: str
 ) -> str:
     """思考生成プロンプトをフォーマット"""
     return THOUGHT_GENERATION_PROMPT.format(
         conversation_context=conversation_context,
         user_memories=user_memories,
-        pending_thoughts=pending_thoughts
+        pending_thoughts=pending_thoughts,
+        expressed_thoughts=expressed_thoughts
     )
 
 
@@ -245,17 +263,16 @@ def format_motivation_evaluation_prompt(
     )
 
 
-def format_proactive_response_prompt(
+def format_proactive_system_prompt(
     thought: str,
-    conversation_context: str,
     user_memories: str,
     silence_duration: float,
     trigger_reason: str
 ) -> str:
-    """自発的発言プロンプトをフォーマット"""
-    return PROACTIVE_RESPONSE_PROMPT.format(
+    """自発的発言のシステムプロンプトをフォーマット"""
+    return PROACTIVE_RESPONSE_SYSTEM_PROMPT.format(
+        persona=config.AI_PERSONA,
         thought=thought,
-        conversation_context=conversation_context,
         user_memories=user_memories,
         silence_duration=int(silence_duration),
         trigger_reason=trigger_reason
@@ -273,15 +290,14 @@ def format_memory_extraction_prompt(
     )
 
 
-def format_silence_break_prompt(
+def format_silence_break_system_prompt(
     user_memories: str,
-    last_conversation: str,
     silence_duration: float
 ) -> str:
-    """沈黙破りプロンプトをフォーマット"""
-    return SILENCE_BREAK_PROMPT.format(
+    """沈黙破りのシステムプロンプトをフォーマット"""
+    return SILENCE_BREAK_SYSTEM_PROMPT.format(
+        persona=config.AI_PERSONA,
         user_memories=user_memories,
-        last_conversation=last_conversation,
         silence_duration=int(silence_duration),
         silence_minutes=int(silence_duration / 60)
     )
