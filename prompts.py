@@ -41,12 +41,16 @@ THOUGHT_GENERATION_PROMPT = """
 ## 保留中の思考（前に考えたけどまだ言っていないこと）
 {pending_thoughts}
 
+## 既に発言済みの内容（Litaが実際に口に出したこと）
+{expressed_thoughts}
+
 ## タスク
 Litaがこの会話の流れを見て、**今この瞬間に**頭に浮かぶ「思考」を1つ生成してください。
 これはLitaが実際に発言するものではなく、キャラクターの心の中の考えをシミュレートしたものです。
 
 重要：会話の「最新の状況」に基づいて考えてください。会話の最初の印象ではなく、直近のやり取りから思考を生成すること。
 保留中の思考と同じ内容・同じ切り口の思考は生成しないでください。
+**既に発言済みの内容と同じテーマ・同じ切り口・同じ意味の思考は絶対に生成しないでください。**別の角度、別の話題で考えること。
 
 ## 出力形式（JSON）
 {{
@@ -61,7 +65,8 @@ Litaがこの会話の流れを見て、**今この瞬間に**頭に浮かぶ「
 # =============================================================================
 
 MOTIVATION_EVALUATION_PROMPT = """
-あなたはAIの「発言したい気持ち」を評価する評価者です。
+あなたはAIの発言を「今出すべきか」判断するブレーキ役です。
+基本スタンス：雑談なので、止める理由がなければ喋ってOK。
 
 ## 評価対象の思考
 {thought}
@@ -78,13 +83,9 @@ MOTIVATION_EVALUATION_PROMPT = """
 
 ## 出力形式（JSON）
 {{
-    "relevance": 1-5の数値,
-    "information_gap": 1-5の数値,
-    "emotional_connection": 1-5の数値,
-    "timing": 1-5の数値,
-    "balance": 1-5の数値,
-    "overall_score": 1-5の数値（上記の加重平均）,
-    "reasoning": "この評価の理由（1-2文）",
+    "brake_triggered": "該当した条件番号（なければnone）",
+    "overall_score": 4（発言OK）or 2（ブレーキ）,
+    "reasoning": "判定理由（1文）",
     "should_speak": true/false
 }}
 """
@@ -232,13 +233,15 @@ def format_system_prompt(user_memories: str) -> str:
 def format_thought_generation_prompt(
     conversation_context: str,
     user_memories: str,
-    pending_thoughts: str
+    pending_thoughts: str,
+    expressed_thoughts: str
 ) -> str:
     """思考生成プロンプトをフォーマット"""
     return THOUGHT_GENERATION_PROMPT.format(
         conversation_context=conversation_context,
         user_memories=user_memories,
-        pending_thoughts=pending_thoughts
+        pending_thoughts=pending_thoughts,
+        expressed_thoughts=expressed_thoughts
     )
 
 

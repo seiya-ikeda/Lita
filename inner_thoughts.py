@@ -76,12 +76,20 @@ class InnerThoughtsEngine:
             f"- {t.content} (スコア: {t.motivation_score})"
             for t in pending
         ]) if pending else "なし"
-        
+
+        # 発言済みの思考
+        expressed = memory.get_expressed_thoughts()
+        expressed_thoughts = "\n".join([
+            f"- {t.content}"
+            for t in expressed
+        ]) if expressed else "なし"
+
         # プロンプト生成
         prompt = prompts.format_thought_generation_prompt(
             conversation_context=conversation_context,
             user_memories=user_memories,
-            pending_thoughts=pending_thoughts
+            pending_thoughts=pending_thoughts,
+            expressed_thoughts=expressed_thoughts
         )
         
         try:
