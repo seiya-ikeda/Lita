@@ -42,19 +42,11 @@ class InnerThoughtsEngine:
         Returns:
             (should_trigger, reason)
         """
-        # 沈黙タイムアウト
+        # 定期的な思考生成
         silence = memory.get_silence_duration()
-        if silence > config.SILENCE_TIMEOUT:
-            return True, f"silence_timeout ({int(silence)}s)"
-        
-        # 定期的な思考生成（会話中）
         if memory.last_user_message_time:
             if silence > config.THOUGHT_GENERATION_INTERVAL:
                 return True, f"periodic ({int(silence)}s since last message)"
-        
-        # ユーザーの新しい発言があった
-        if memory.short_term and memory.short_term[-1].role == "user":
-            return True, "new_user_message"
         
         return False, ""
     
@@ -206,11 +198,10 @@ class InnerThoughtsEngine:
     
     async def generate_silence_break(self, memory: MemoryManager) -> str:
         """
-        沈黙を破る発言を生成
+        沈黙を破る発言を生成（long-term memory ドリブン）
 
-        注意: 現在は未使用。沈黙タイムアウトも通常の思考生成→動機づけ評価パイプラインを
-        通すように変更したため、この専用メソッドは呼ばれない。
-        沈黙破り専用の生成ロジックが必要になった場合に備えて残している。
+        silence >= SILENCE_TIMEOUT のとき、information_gatherer で記事が見つからない
+        場合のフォールバック。long-term memory から「そういえば～」を生成する。
         """
         system_prompt = prompts.format_silence_break_system_prompt(
             user_memories=memory.get_all_memories_summary(),

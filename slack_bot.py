@@ -51,8 +51,8 @@ class ProactiveAISlackBot:
         # 処理中フラグ（二重応答防止）
         self.processing: set[str] = set()
 
-        # 情報収集の最終検索時刻
-        self.last_info_search: dict[str, datetime] = {}
+        # silence breakout の最終試行時刻
+        self.last_silence_breakout: dict[str, datetime] = {}
 
         # Bot自身のユーザーID（起動時に取得）
         self.bot_user_id: str = ""
@@ -210,99 +210,99 @@ class ProactiveAISlackBot:
 
             for user_id, memory in list(self.memories.items()):
                 try:
-                    result = await self.engine.process_proactive_cycle(memory)
+                    silence = memory.get_silence_duration()
 
-                    if result is None:
-                        continue
+                    if silence >= config.SILENCE_TIMEOUT:
+                        # 長い沈黙 → long-term memory ドリブン（silence breakout）
+                        await self._run_silence_breakout(user_id, memory)
+                    else:
+                        # 短い沈黙 → short-term memory ドリブン（periodic thought）
+                        result = await self.engine.process_proactive_cycle(memory)
 
-                    # 思考ログを記録（発言の有無に関わらず）
-                    if result.get("thought_content"):
-                        self.logger.log_thought(
-                            user_id=user_id,
-                            thought_content=result["thought_content"],
-                            trigger_reason=result["trigger_reason"],
-                            motivation_score=result["motivation_score"],
-                            evaluation_details=result["evaluation"],
-                            was_expressed=result["was_expressed"],
-                            response_if_expressed=result.get("response"),
-                        )
+                        if result is None:
+                            continue
 
-                    # 発言がある場合のみ送信
-                    response = result.get("response")
-                    if response:
-                        channel = self.user_channels.get(user_id)
-                        if channel:
-                            memory.add_message("assistant", response)
-                            self.logger.log_ai_response(
-                                user_id, response, is_proactive=True,
-                                metadata={
-                                    "trigger": result["trigger_reason"],
-                                    "motivation_score": result["motivation_score"],
-                                }
+                        # 思考ログを記録（発言の有無に関わらず）
+                        if result.get("thought_content"):
+                            self.logger.log_thought(
+                                user_id=user_id,
+                                thought_content=result["thought_content"],
+                                trigger_reason=result["trigger_reason"],
+                                motivation_score=result["motivation_score"],
+                                evaluation_details=result["evaluation"],
+                                was_expressed=result["was_expressed"],
+                                response_if_expressed=result.get("response"),
                             )
 
-                            await self.app.client.chat_postMessage(
-                                channel=channel,
-                                text=response
-                            )
+                        # 発言がある場合のみ送信
+                        response = result.get("response")
+                        if response:
+                            channel = self.user_channels.get(user_id)
+                            if channel:
+                                memory.add_message("assistant", response)
+                                self.logger.log_ai_response(
+                                    user_id, response, is_proactive=True,
+                                    metadata={
+                                        "trigger": result["trigger_reason"],
+                                        "motivation_score": result["motivation_score"],
+                                    }
+                                )
+                                await self.app.client.chat_postMessage(
+                                    channel=channel,
+                                    text=response
+                                )
 
                 except Exception as e:
                     print(f"Proactive cycle error for {user_id}: {e}")
 
-    # =========================================================================
-    # 情報収集サイクル
-    # =========================================================================
+    async def _run_silence_breakout(self, user_id: str, memory: MemoryManager):
+        """長い沈黙でのlong-term memory駆動の話しかけ"""
+        if not memory.can_intervene():
+            return
 
-    async def _information_gathering_loop(self):
-        """定期的に実行される情報収集サイクル"""
-        while True:
-            await asyncio.sleep(30 * 60)  # 30分間隔
+        if not memory.long_term:
+            return
 
-            if not config.BRAVE_SEARCH_API_KEY:
-                continue
+        # 試行間隔チェック
+        now = datetime.now()
+        last_attempt = self.last_silence_breakout.get(user_id)
+        if last_attempt:
+            elapsed = (now - last_attempt).total_seconds()
+            if elapsed < config.SILENCE_BREAKOUT_INTERVAL:
+                return
 
-            now = datetime.now()
+        self.last_silence_breakout[user_id] = now
 
-            for user_id, memory in list(self.memories.items()):
-                try:
-                    last_search = self.last_info_search.get(user_id)
-                    if last_search:
-                        elapsed = (now - last_search).total_seconds()
-                        if elapsed < config.SEARCH_INTERVAL:
-                            continue
+        channel = self.user_channels.get(user_id)
+        if not channel:
+            return
 
-                    if not memory.long_term:
-                        continue
+        message = None
+        metadata = {}
 
-                    if not memory.can_intervene():
-                        continue
+        # まず information_gatherer を試す（記憶 × 外部情報）
+        if config.BRAVE_SEARCH_API_KEY:
+            result = await self.info_gatherer.find_shareable_article(memory)
+            if result:
+                article, message = result
+                metadata = {
+                    "trigger": "silence_breakout_info",
+                    "article_title": article.title,
+                    "article_url": article.url,
+                    "relevance_score": article.relevance_score,
+                }
 
-                    result = await self.info_gatherer.find_shareable_article(memory)
+        # なければ純粋な記憶から「そういえば～」を生成
+        if not message:
+            message = await self.engine.generate_silence_break(memory)
+            if message:
+                metadata = {"trigger": "silence_breakout_memory"}
 
-                    if result:
-                        article, message = result
-                        channel = self.user_channels.get(user_id)
-                        if channel:
-                            memory.add_message("assistant", message)
-                            self.logger.log_ai_response(
-                                user_id, message, is_proactive=True,
-                                metadata={
-                                    "trigger": "information_share",
-                                    "article_title": article.title,
-                                    "article_url": article.url,
-                                    "relevance_score": article.relevance_score
-                                }
-                            )
+        if message:
+            memory.add_message("assistant", message)
+            self.logger.log_ai_response(user_id, message, is_proactive=True, metadata=metadata)
+            await self.app.client.chat_postMessage(channel=channel, text=message)
 
-                            await self.app.client.chat_postMessage(
-                                channel=channel,
-                                text=message
-                            )
-
-                    self.last_info_search[user_id] = now
-
-                except Exception as e:
-                    print(f"Information gathering error for {user_id}: {e}")
 
     # =========================================================================
     # スラッシュコマンド
@@ -566,8 +566,6 @@ class ProactiveAISlackBot:
         if config.EXPERIMENT_CONDITION == "proactive":
             asyncio.create_task(self._proactive_loop())
 
-        if config.ENABLE_INFORMATION_GATHERING:
-            asyncio.create_task(self._information_gathering_loop())
 
         # Socket Modeで接続
         handler = AsyncSocketModeHandler(self.app, config.SLACK_APP_TOKEN)

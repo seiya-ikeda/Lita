@@ -61,8 +61,12 @@ MOTIVATION_THRESHOLD = 4
 THOUGHT_GENERATION_INTERVAL = 30
 
 # 沈黙タイムアウト（秒）
-# この時間ユーザーが発言しなかったら、AIから話しかける
+# この時間を超えたら short-term → long-term memory ドリブンに切り替える
 SILENCE_TIMEOUT = 180  # 3分
+
+# silence breakout の試行間隔（秒）
+# long-term memoryから話しかけを試みる最小間隔
+SILENCE_BREAKOUT_INTERVAL = 600  # 10分
 
 # 連続介入の制限
 # AIが連続で発言できる最大回数（押しつけがましさ防止）
