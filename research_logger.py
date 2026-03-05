@@ -39,6 +39,19 @@ class ThoughtLog:
 
 
 @dataclass
+class InternalStateLog:
+    """内部状態ログエントリ"""
+    timestamp: str
+    session_id: str
+    user_id: str
+    loneliness: float
+    curiosity: float
+    social_energy: float
+    trigger: str      # "passive_drift" | "conversation_update"
+    reasoning: str
+
+
+@dataclass
 class InteractionMetrics:
     """インタラクション指標"""
     session_id: str
@@ -75,6 +88,7 @@ class ResearchLogger:
         os.makedirs(f"{self.log_dir}/conversations", exist_ok=True)
         os.makedirs(f"{self.log_dir}/thoughts", exist_ok=True)
         os.makedirs(f"{self.log_dir}/metrics", exist_ok=True)
+        os.makedirs(f"{self.log_dir}/internal_state", exist_ok=True)
         
         # セッション内のログ
         self.conversation_logs: list[ConversationLog] = []
@@ -168,6 +182,32 @@ class ResearchLogger:
         self.thought_logs.append(log)
         self._append_to_csv("thoughts", log)
     
+    # =========================================================================
+    # 内部状態ログ
+    # =========================================================================
+
+    def log_internal_state(
+        self,
+        user_id: str,
+        loneliness: float,
+        curiosity: float,
+        social_energy: float,
+        trigger: str,
+        reasoning: str = "",
+    ):
+        """内部状態の変化をログ"""
+        log = InternalStateLog(
+            timestamp=datetime.now().isoformat(),
+            session_id=self.session_id,
+            user_id=user_id,
+            loneliness=loneliness,
+            curiosity=curiosity,
+            social_energy=social_energy,
+            trigger=trigger,
+            reasoning=reasoning,
+        )
+        self._append_to_csv("internal_state", log)
+
     # =========================================================================
     # 指標計算
     # =========================================================================
@@ -286,9 +326,9 @@ class ResearchLogger:
             "end_time": datetime.now().isoformat(),
             "config": {
                 "motivation_threshold": config.MOTIVATION_THRESHOLD,
-                "silence_timeout": config.SILENCE_TIMEOUT,
                 "thought_generation_interval": config.THOUGHT_GENERATION_INTERVAL,
-                "max_consecutive_interventions": config.MAX_CONSECUTIVE_INTERVENTIONS
+                "max_consecutive_interventions": config.MAX_CONSECUTIVE_INTERVENTIONS,
+                "min_intervention_interval": config.MIN_INTERVENTION_INTERVAL,
             },
             "thought_statistics": self.get_thought_statistics(),
             "total_logs": len(self.conversation_logs)

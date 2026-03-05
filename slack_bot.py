@@ -7,12 +7,13 @@ import asyncio
 import re
 import uuid
 from datetime import datetime
+from typing import Optional
 
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
 import config
-from memory import MemoryManager
+from memory import MemoryManager, SelfNarrative
 from inner_thoughts import InnerThoughtsEngine
 from research_logger import ResearchLogger
 from information_gatherer import InformationGatherer
@@ -41,6 +42,12 @@ class ProactiveAISlackBot:
         # ユーザーごとの記憶管理
         self.memories: dict[str, MemoryManager] = {}
 
+        # Lita自己史（ユーザーをまたいで共有）
+        self.narrative = SelfNarrative()
+
+        # 最終ナラティブ整理時刻
+        self.last_narrative_consolidation: Optional[datetime] = None
+
         # セッション管理
         self.session_id = str(uuid.uuid4())[:8]
         self.logger = ResearchLogger(self.session_id)
@@ -50,9 +57,6 @@ class ProactiveAISlackBot:
 
         # 処理中フラグ（二重応答防止）
         self.processing: set[str] = set()
-
-        # silence breakout の最終試行時刻
-        self.last_silence_breakout: dict[str, datetime] = {}
 
         # Bot自身のユーザーID（起動時に取得）
         self.bot_user_id: str = ""
@@ -113,6 +117,16 @@ class ProactiveAISlackBot:
             await ack()
             await self._cmd_export(command, client)
 
+        @self.app.command("/lita-narrative")
+        async def handle_narrative(ack, command, client):
+            await ack()
+            await self._cmd_narrative(command, client)
+
+        @self.app.command("/lita-usermodel")
+        async def handle_usermodel(ack, command, client):
+            await ack()
+            await self._cmd_usermodel(command, client)
+
     # =========================================================================
     # メッセージ処理
     # =========================================================================
@@ -154,15 +168,13 @@ class ProactiveAISlackBot:
             # ユーザーとチャンネルの対応を保存
             self.user_channels[user_id] = channel
 
+            # 応答タイプを判定（add_message前にコンテキストを取得し、現在のメッセージが混入しないようにする）
+            context = memory.get_context_summary()
+            decision = await self.classifier.classify(content, context)
+
             # ユーザーメッセージを記録
             memory.add_message("user", content)
             self.logger.log_user_message(user_id, content)
-
-            # 応答タイプを判定
-            decision = await self.classifier.classify(
-                content,
-                memory.get_context_summary()
-            )
 
             if decision.action == "react" and decision.reaction:
                 # リアクションで十分な場合
@@ -171,16 +183,29 @@ class ProactiveAISlackBot:
                     timestamp=ts,
                     name=self._sanitize_reaction_name(decision.reaction)
                 )
+                # short_termにも記録（proactiveループの「last==user」スキップを解除するため）
+                memory.add_message("assistant", f"[reaction: {decision.reaction}]")
                 self.logger.log_ai_response(
                     user_id,
                     f"[reaction: {decision.reaction}]",
                     is_proactive=False,
                     metadata={"type": "reaction", "reason": decision.reason}
                 )
+                # 思考ログにもリアクション判断を記録
+                if config.LOG_THOUGHTS:
+                    self.logger.log_thought(
+                        user_id=user_id,
+                        thought_content=f"「{content[:50]}」に対してリアクションで返す: {decision.reason}",
+                        trigger_reason="user_message (classifier: react)",
+                        motivation_score=5,
+                        evaluation_details={"action": "react", "reaction": decision.reaction, "reason": decision.reason},
+                        was_expressed=True,
+                        response_if_expressed=f"[reaction: {decision.reaction}]",
+                    )
 
             elif decision.action == "reply":
                 # 返信を生成
-                response = await self.engine.generate_reactive_response(memory)
+                response = await self.engine.generate_reactive_response(memory, self.narrative)
 
                 is_fallback = "調子悪いみたい..." in response
                 if not is_fallback:
@@ -196,6 +221,16 @@ class ProactiveAISlackBot:
             if len(memory.short_term) >= 5 and len(memory.short_term) % 5 <= 1:
                 await self._extract_and_save_memories(memory)
 
+            # 自己ナラティブ + ユーザーモデル更新（10ターンごと）
+            if len(memory.short_term) >= 10 and len(memory.short_term) % 10 <= 1:
+                await self._update_narrative(memory)
+                await self._update_user_model(memory)
+
+            # 内部状態更新（5ターンごと）
+            if len(memory.short_term) >= config.INTERNAL_STATE_UPDATE_INTERVAL and \
+               len(memory.short_term) % config.INTERNAL_STATE_UPDATE_INTERVAL <= 1:
+                await self._update_internal_state(memory)
+
         finally:
             self.processing.discard(process_key)
 
@@ -204,104 +239,72 @@ class ProactiveAISlackBot:
     # =========================================================================
 
     async def _proactive_loop(self):
-        """定期的に実行されるProactiveサイクル"""
+        """定期的に実行されるProactiveサイクル（思考生成 → ブレーキ評価 → 発話）"""
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(config.THOUGHT_GENERATION_INTERVAL)
 
             for user_id, memory in list(self.memories.items()):
                 try:
-                    silence = memory.get_silence_duration()
+                    # Reactiveが未応答のユーザーメッセージがある場合はスキップ（二重応答防止）
+                    if memory.short_term and memory.short_term[-1].role == "user":
+                        continue
 
-                    if silence >= config.SILENCE_TIMEOUT:
-                        # 長い沈黙 → long-term memory ドリブン（silence breakout）
-                        await self._run_silence_breakout(user_id, memory)
-                    else:
-                        # 短い沈黙 → short-term memory ドリブン（periodic thought）
-                        result = await self.engine.process_proactive_cycle(memory)
+                    result = await self.engine.process_proactive_cycle(memory, self.narrative)
+                    if result is None:
+                        continue
 
-                        if result is None:
-                            continue
+                    # passive drift 適用後の内部状態をログ
+                    s = memory.internal_state.state
+                    self.logger.log_internal_state(
+                        user_id=user_id,
+                        loneliness=s.loneliness,
+                        curiosity=s.curiosity,
+                        social_energy=s.social_energy,
+                        trigger="passive_drift",
+                    )
 
-                        # 思考ログを記録（発言の有無に関わらず）
-                        if result.get("thought_content"):
-                            self.logger.log_thought(
-                                user_id=user_id,
-                                thought_content=result["thought_content"],
-                                trigger_reason=result["trigger_reason"],
-                                motivation_score=result["motivation_score"],
-                                evaluation_details=result["evaluation"],
-                                was_expressed=result["was_expressed"],
-                                response_if_expressed=result.get("response"),
+                    # 思考ログを記録（発言の有無に関わらず）
+                    if result.get("thought_content"):
+                        self.logger.log_thought(
+                            user_id=user_id,
+                            thought_content=result["thought_content"],
+                            trigger_reason=result["trigger_reason"],
+                            motivation_score=result["motivation_score"],
+                            evaluation_details=result["evaluation"],
+                            was_expressed=result["was_expressed"],
+                            response_if_expressed=result.get("response"),
+                        )
+
+                    # 発言がある場合のみ送信
+                    response = result.get("response")
+                    if response:
+                        channel = self.user_channels.get(user_id)
+                        if channel:
+                            memory.add_message("assistant", response)
+                            self.logger.log_ai_response(
+                                user_id, response, is_proactive=True,
+                                metadata={
+                                    "trigger": result["trigger_reason"],
+                                    "motivation_score": result["motivation_score"],
+                                }
                             )
-
-                        # 発言がある場合のみ送信
-                        response = result.get("response")
-                        if response:
-                            channel = self.user_channels.get(user_id)
-                            if channel:
-                                memory.add_message("assistant", response)
-                                self.logger.log_ai_response(
-                                    user_id, response, is_proactive=True,
-                                    metadata={
-                                        "trigger": result["trigger_reason"],
-                                        "motivation_score": result["motivation_score"],
-                                    }
-                                )
-                                await self.app.client.chat_postMessage(
-                                    channel=channel,
-                                    text=response
-                                )
+                            await self.app.client.chat_postMessage(
+                                channel=channel,
+                                text=response
+                            )
 
                 except Exception as e:
                     print(f"Proactive cycle error for {user_id}: {e}")
 
-    async def _run_silence_breakout(self, user_id: str, memory: MemoryManager):
-        """長い沈黙でのlong-term memory駆動の話しかけ"""
-        if not memory.can_intervene():
-            return
-
-        if not memory.long_term:
-            return
-
-        # 試行間隔チェック
-        now = datetime.now()
-        last_attempt = self.last_silence_breakout.get(user_id)
-        if last_attempt:
-            elapsed = (now - last_attempt).total_seconds()
-            if elapsed < config.SILENCE_BREAKOUT_INTERVAL:
-                return
-
-        self.last_silence_breakout[user_id] = now
-
-        channel = self.user_channels.get(user_id)
-        if not channel:
-            return
-
-        message = None
-        metadata = {}
-
-        # まず information_gatherer を試す（記憶 × 外部情報）
-        if config.BRAVE_SEARCH_API_KEY:
-            result = await self.info_gatherer.find_shareable_article(memory)
-            if result:
-                article, message = result
-                metadata = {
-                    "trigger": "silence_breakout_info",
-                    "article_title": article.title,
-                    "article_url": article.url,
-                    "relevance_score": article.relevance_score,
-                }
-
-        # なければ純粋な記憶から「そういえば～」を生成
-        if not message:
-            message = await self.engine.generate_silence_break(memory)
-            if message:
-                metadata = {"trigger": "silence_breakout_memory"}
-
-        if message:
-            memory.add_message("assistant", message)
-            self.logger.log_ai_response(user_id, message, is_proactive=True, metadata=metadata)
-            await self.app.client.chat_postMessage(channel=channel, text=message)
+    async def _narrative_consolidation_loop(self):
+        """週次: ナラティブを整理・統合（睡眠サイクル）"""
+        while True:
+            await asyncio.sleep(config.NARRATIVE_CONSOLIDATION_INTERVAL)
+            try:
+                print("[Narrative] Starting weekly consolidation...")
+                await self.engine.consolidate_narrative(self.narrative)
+            except Exception as e:
+                print(f"Narrative consolidation loop error: {e}")
 
 
     # =========================================================================
@@ -357,6 +360,17 @@ class ProactiveAISlackBot:
                     {"type": "mrkdwn", "text": f"*Avg motivation:* {stats.get('avg_motivation_score', 0):.2f}"},
                 ]
             })
+
+        # 内部状態（このユーザーとの関係）
+        memory.internal_state.apply_passive_drift()
+        s = memory.internal_state.state
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": (
+                f"*Internal State:*\n"
+                f"孤独感 {s.loneliness:.1f}/10  好奇心 {s.curiosity:.1f}/10  社交エネルギー {s.social_energy:.1f}/10"
+            )}
+        })
 
         await client.chat_postEphemeral(
             channel=channel, user=user_id, blocks=blocks,
@@ -429,12 +443,11 @@ class ProactiveAISlackBot:
             f"*Proactive Settings*\n"
             f"- Motivation threshold: {config.MOTIVATION_THRESHOLD}\n"
             f"- Thought interval: {config.THOUGHT_GENERATION_INTERVAL}s\n"
-            f"- Silence timeout: {config.SILENCE_TIMEOUT}s\n"
+            f"- Min intervention interval: {config.MIN_INTERVENTION_INTERVAL}s\n"
             f"- Max consecutive: {config.MAX_CONSECUTIVE_INTERVENTIONS}\n\n"
             f"*Information Gathering*\n"
             f"- Enabled: {config.ENABLE_INFORMATION_GATHERING}\n"
             f"- Search interval: {config.SEARCH_INTERVAL}s\n"
-            f"- Share threshold: {config.INFO_SHARE_MOTIVATION_THRESHOLD}\n"
             f"- Max daily shares: {config.MAX_DAILY_SHARES}"
         )
 
@@ -500,6 +513,33 @@ class ProactiveAISlackBot:
                 text="今回は特に良さそうな情報が見つからなかったかも...また後で探してみるね！"
             )
 
+    async def _cmd_narrative(self, command, client):
+        """Litaの自己認識を表示"""
+        user_id = command["user_id"]
+        channel = command["channel_id"]
+
+        summary = self.narrative.get_summary(max_entries=10)
+        count = len(self.narrative.entries)
+
+        await client.chat_postEphemeral(
+            channel=channel, user=user_id,
+            text=f"*Litaの自己認識（{count}エントリ）:*\n{summary if summary != 'なし' else 'まだ形成されていません'}"
+        )
+
+    async def _cmd_usermodel(self, command, client):
+        """ユーザーモデルを表示"""
+        user_id = command["user_id"]
+        channel = command["channel_id"]
+        memory = self._get_memory(user_id)
+
+        summary = memory.get_user_model_summary()
+        count = len(memory.user_model.entries)
+
+        await client.chat_postEphemeral(
+            channel=channel, user=user_id,
+            text=f"*Litaが観測したあなたのパターン（{count}エントリ）:*\n{summary if summary != 'なし' else 'まだ観測されていません'}"
+        )
+
     async def _cmd_export(self, command, client):
         """ログをエクスポート"""
         user_id = command["user_id"]
@@ -526,8 +566,17 @@ class ProactiveAISlackBot:
     @staticmethod
     def _sanitize_reaction_name(name: str) -> str:
         """LLMが返したリアクション名をサニタイズ"""
+        import re
         # コロンや余分な空白を除去（:thumbsup: → thumbsup）
-        return name.strip().strip(":")
+        name = name.strip().strip(":").strip()
+        # スペースをアンダースコアに変換
+        name = name.replace(" ", "_")
+        # 小文字に変換
+        name = name.lower()
+        # Slack絵文字名に使えない文字を除去（英数字・アンダースコア・ハイフンのみ許可）
+        name = re.sub(r"[^a-z0-9_\-]", "", name)
+        # 空になったらデフォルトに
+        return name if name else "thumbsup"
 
     async def _extract_and_save_memories(self, memory: MemoryManager):
         """記憶を抽出して保存（importance 4以上のみ）"""
@@ -545,6 +594,37 @@ class ProactiveAISlackBot:
                     print(f"[DEBUG] Memory skipped (importance {importance} < 4): {mem.get('content', '')[:50]}")
         except Exception as e:
             print(f"Memory extraction error: {e}")
+
+    async def _update_narrative(self, memory: MemoryManager):
+        """自己ナラティブを更新"""
+        try:
+            entry = await self.engine.update_self_narrative(memory, self.narrative)
+            if entry:
+                print(f"[Narrative] Updated for user {memory.user_id}")
+        except Exception as e:
+            print(f"Narrative update error: {e}")
+
+    async def _update_user_model(self, memory: MemoryManager):
+        """ユーザーモデルを更新"""
+        try:
+            await self.engine.update_user_model(memory)
+        except Exception as e:
+            print(f"User model update error: {e}")
+
+    async def _update_internal_state(self, memory: MemoryManager):
+        """内部状態を更新"""
+        try:
+            await self.engine.update_internal_state(memory, memory.internal_state)
+            s = memory.internal_state.state
+            self.logger.log_internal_state(
+                user_id=memory.user_id,
+                loneliness=s.loneliness,
+                curiosity=s.curiosity,
+                social_energy=s.social_energy,
+                trigger="conversation_update",
+            )
+        except Exception as e:
+            print(f"InternalState update error: {e}")
 
     # =========================================================================
     # 起動
@@ -565,6 +645,7 @@ class ProactiveAISlackBot:
         # バックグラウンドタスクを起動
         if config.EXPERIMENT_CONDITION == "proactive":
             asyncio.create_task(self._proactive_loop())
+            asyncio.create_task(self._narrative_consolidation_loop())
 
 
         # Socket Modeで接続

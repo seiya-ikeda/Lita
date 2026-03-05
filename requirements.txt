@@ -22,3 +22,5 @@ pandas>=2.0.0
 
 # Date/time handling
 python-dateutil>=2.8.0
+
+matlplotlib>=3.0.0

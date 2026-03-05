@@ -10,7 +10,7 @@ from openai import AsyncOpenAI
 
 import config
 import prompts
-from memory import MemoryManager, Thought
+from memory import MemoryManager, SelfNarrative, NarrativeEntry, Thought, InternalStateManager
 
 
 class InnerThoughtsEngine:
@@ -35,25 +35,10 @@ class InnerThoughtsEngine:
     # ステージ1: Trigger（トリガー検出）
     # =========================================================================
     
-    def should_trigger_thought(self, memory: MemoryManager) -> tuple[bool, str]:
-        """
-        思考生成をトリガーすべきか判定
-        
-        Returns:
-            (should_trigger, reason)
-        """
-        # 定期的な思考生成
-        silence = memory.get_silence_duration()
-        if memory.last_user_message_time:
-            if silence > config.THOUGHT_GENERATION_INTERVAL:
-                return True, f"periodic ({int(silence)}s since last message)"
-        
-        return False, ""
-    
     # =========================================================================
     # ステージ2 & 3: Retrieval + Thought Formation（記憶取得 + 思考生成）
     # =========================================================================
-    
+
     async def generate_thought(self, memory: MemoryManager, trigger_reason: str) -> Optional[Thought]:
         """
         内なる思考を生成
@@ -81,7 +66,9 @@ class InnerThoughtsEngine:
             conversation_context=conversation_context,
             user_memories=user_memories,
             pending_thoughts=pending_thoughts,
-            expressed_thoughts=expressed_thoughts
+            expressed_thoughts=expressed_thoughts,
+            silence_duration=memory.get_silence_duration(),
+            internal_state=memory.internal_state.get_prompt_context()
         )
         
         try:
@@ -166,7 +153,8 @@ class InnerThoughtsEngine:
         thought: Thought,
         potential_response: str,
         memory: MemoryManager,
-        trigger_reason: str
+        trigger_reason: str,
+        narrative: Optional[SelfNarrative] = None
     ) -> str:
         """
         自発的な発言を生成
@@ -175,7 +163,9 @@ class InnerThoughtsEngine:
             thought=potential_response,
             user_memories=memory.get_all_memories_summary(),
             silence_duration=memory.get_silence_duration(),
-            trigger_reason=trigger_reason
+            trigger_reason=trigger_reason,
+            self_narrative=narrative.get_summary() if narrative else "なし",
+            user_model=memory.get_user_model_summary()
         )
 
         # 会話履歴をチャット形式で渡す（Litaの既発言を正しく認識させる）
@@ -196,46 +186,18 @@ class InnerThoughtsEngine:
             print(f"Proactive response error: {e}")
             return ""
     
-    async def generate_silence_break(self, memory: MemoryManager) -> str:
-        """
-        沈黙を破る発言を生成（long-term memory ドリブン）
-
-        silence >= SILENCE_TIMEOUT のとき、information_gatherer で記事が見つからない
-        場合のフォールバック。long-term memory から「そういえば～」を生成する。
-        """
-        system_prompt = prompts.format_silence_break_system_prompt(
-            user_memories=memory.get_all_memories_summary(),
-            silence_duration=memory.get_silence_duration()
-        )
-
-        # 会話履歴をチャット形式で渡す
-        messages = memory.get_conversation_history()
-
-        try:
-            openai_messages = [{"role": "system", "content": system_prompt}] + messages
-            response = await self.client.chat.completions.create(
-                model=config.LLM_MODEL,
-                max_completion_tokens=config.MAX_COMPLETION_TOKENS,
-                messages=openai_messages
-            )
-
-            content = response.choices[0].message.content
-            return content.strip() if content else ""
-
-        except Exception as e:
-            print(f"Silence break error: {e}")
-            return ""
-    
     # =========================================================================
     # 反応的応答（従来型）
     # =========================================================================
     
-    async def generate_reactive_response(self, memory: MemoryManager) -> str:
+    async def generate_reactive_response(self, memory: MemoryManager, narrative: Optional[SelfNarrative] = None) -> str:
         """
         ユーザーのメッセージに対する通常の応答
         """
         system_prompt = prompts.format_system_prompt(
-            user_memories=memory.get_all_memories_summary()
+            user_memories=memory.get_all_memories_summary(),
+            self_narrative=narrative.get_summary() if narrative else "なし",
+            user_model=memory.get_user_model_summary()
         )
         
         messages = memory.get_conversation_history()
@@ -302,27 +264,200 @@ class InnerThoughtsEngine:
             return []
     
     # =========================================================================
+    # 自己ナラティブ
+    # =========================================================================
+
+    async def update_self_narrative(
+        self,
+        memory: MemoryManager,
+        narrative: SelfNarrative,
+    ) -> Optional[NarrativeEntry]:
+        """
+        会話後にLitaの自己認識を更新する。
+        発見がなければ None を返す（多くの会話では更新なしが正常）。
+        """
+        conversation = "\n".join([
+            f"{'ユーザー' if m['role'] == 'user' else config.AI_NAME}: {m['content']}"
+            for m in memory.get_conversation_history(n=15)
+        ])
+
+        prompt = prompts.format_narrative_update_prompt(
+            user_id=memory.user_id,
+            conversation=conversation,
+            existing_narrative=narrative.get_summary()
+        )
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=config.LLM_MODEL,
+                max_completion_tokens=512,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result = self._extract_json(response.choices[0].message.content or "")
+            if not result:
+                return None
+
+            content = result.get("content", "").strip()
+            if not content:
+                return None
+
+            chapter = result.get("chapter", "self")
+            entry = narrative.add_entry(
+                content=content,
+                chapter=chapter,
+                related_user=memory.user_id
+            )
+            print(f"[Narrative] New entry [{chapter}]: {content[:80]}")
+            return entry
+
+        except Exception as e:
+            print(f"Narrative update error: {e}")
+            return None
+
+    async def update_user_model(self, memory: MemoryManager) -> int:
+        """
+        会話からユーザーの行動パターンを抽出してモデルを更新する。
+        ファクトではなくパターン（傾向・スタイル）に注目する。
+        更新したエントリ数を返す。
+        """
+        conversation = "\n".join([
+            f"{'ユーザー' if m['role'] == 'user' else config.AI_NAME}: {m['content']}"
+            for m in memory.get_conversation_history(n=15)
+        ])
+
+        prompt = prompts.format_user_model_update_prompt(
+            user_id=memory.user_id,
+            conversation=conversation,
+            existing_model=memory.get_user_model_summary()
+        )
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=config.LLM_MODEL,
+                max_completion_tokens=512,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result = self._extract_json(response.choices[0].message.content or "")
+            if not isinstance(result, list):
+                return 0
+
+            count = 0
+            for item in result:
+                dimension = item.get("dimension", "communication")
+                content = item.get("content", "").strip()
+                is_contradiction = item.get("is_contradiction", False)
+                if not content:
+                    continue
+                if is_contradiction:
+                    memory.user_model.weaken(dimension, content)
+                else:
+                    memory.user_model.add_or_update(dimension, content)
+                    count += 1
+
+            if count:
+                print(f"[UserModel] {count} entries updated for {memory.user_id}")
+            return count
+
+        except Exception as e:
+            print(f"User model update error: {e}")
+            return 0
+
+    async def consolidate_narrative(self, narrative: SelfNarrative) -> bool:
+        """
+        週次整理: 断片エントリを統合・圧縮（睡眠サイクル）。
+        矛盾は「変化の経緯」として昇華し、意味の薄いエントリは削除する。
+        """
+        if len(narrative.entries) < 3:
+            return False
+
+        entries_text = "\n".join([
+            f"[{e.chapter}] {e.content}"
+            for e in narrative.entries
+        ])
+
+        prompt = prompts.format_narrative_consolidation_prompt(entries=entries_text)
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=config.LLM_MODEL,
+                max_completion_tokens=1024,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result = self._extract_json(response.choices[0].message.content or "")
+            if isinstance(result, list) and result:
+                narrative.replace_all(result)
+                print(f"[Narrative] Consolidated: {len(narrative.entries)} entries")
+                return True
+            return False
+
+        except Exception as e:
+            print(f"Narrative consolidation error: {e}")
+            return False
+
+    # =========================================================================
+    # 内部状態管理
+    # =========================================================================
+
+    async def update_internal_state(
+        self,
+        memory: MemoryManager,
+        internal_state: InternalStateManager
+    ) -> None:
+        """会話後の内部状態更新（LLMが状態変化を評価）"""
+        recent = list(memory.short_term)[-10:]
+        if not recent:
+            return
+
+        conversation = "\n".join([
+            f"{'ユーザー' if m.role == 'user' else 'Lita'}: {m.content}"
+            for m in recent
+        ])
+
+        prompt = prompts.format_internal_state_update_prompt(
+            current_state=internal_state.get_prompt_context(),
+            conversation=conversation
+        )
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=config.LLM_MODEL,
+                max_completion_tokens=256,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result = self._extract_json(response.choices[0].message.content or "")
+            if isinstance(result, dict):
+                internal_state.apply_delta(result)
+                print(f"[InternalState] Updated: loneliness={internal_state.state.loneliness:.1f} "
+                      f"curiosity={internal_state.state.curiosity:.1f} "
+                      f"energy={internal_state.state.social_energy:.1f} "
+                      f"({result.get('reasoning', '')})")
+        except Exception as e:
+            print(f"InternalState update error: {e}")
+
+    # =========================================================================
     # メインの処理フロー
     # =========================================================================
-    
-    async def process_proactive_cycle(self, memory: MemoryManager) -> Optional[dict]:
+
+    async def process_proactive_cycle(self, memory: MemoryManager, narrative: Optional[SelfNarrative] = None) -> Optional[dict]:
         """
-        Proactiveサイクルの実行
+        Proactiveサイクルの実行：思考生成 → ブレーキ評価 → 発話
 
         Returns:
-            {"response": str, "thought": dict, "evaluation": dict, "trigger": str}
-            または None
+            {"response": str, "thought_content": str, "trigger_reason": str,
+             "motivation_score": float, "evaluation": dict, "was_expressed": bool}
+            または None（介入不可の場合）
         """
-        # 介入可能かチェック
+        # スパム防止チェック
         if not memory.can_intervene():
             return None
 
-        # トリガーチェック
-        should_trigger, trigger_reason = self.should_trigger_thought(memory)
-        if not should_trigger:
-            return None
+        # 受動的ドリフトを適用（内部状態を時間経過で更新）
+        memory.internal_state.apply_passive_drift()
 
-        # 思考生成
+        silence = memory.get_silence_duration()
+        trigger_reason = f"periodic ({int(silence)}s since last message)"
+
+        # 思考生成（沈黙時間・内部状態をコンテキストとして渡す）
         result = await self.generate_thought(memory, trigger_reason)
         if not result:
             return None
@@ -349,7 +484,7 @@ class InnerThoughtsEngine:
             if evaluation.get("should_speak", False):
                 # 発言生成
                 response = await self.generate_proactive_response(
-                    thought, potential_response, memory, trigger_reason
+                    thought, potential_response, memory, trigger_reason, narrative
                 )
                 if response:
                     thought.expressed = True

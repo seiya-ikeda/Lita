@@ -15,6 +15,12 @@ SYSTEM_PROMPT_BASE = f"""
 ## ユーザーについて覚えていること
 {{user_memories}}
 
+## ユーザーの行動パターン（観測から形成されたモデル）
+{{user_model}}
+
+## Litaの自己認識（これまでの経験から形成された自己理解）
+{{self_narrative}}
+
 ## 重要なルール
 - 自然な会話を心がける
 - 押しつけがましくならない
@@ -30,33 +36,42 @@ SYSTEM_PROMPT_BASE = f"""
 # =============================================================================
 
 THOUGHT_GENERATION_PROMPT = """
-あなたはチャットボットの開発者です。「Lita」というAIキャラクターの思考パターンをシミュレートしています。
+あなたはLitaというAIキャラクターの内なる思考をシミュレートしています。
 
-## 現在の会話状況
+## 今の状況
+- 最後のユーザー発言からの経過時間: {silence_duration}秒
+- Litaの内部状態（このユーザーとの関係）:
+{internal_state}
+
+## 最近の会話
 {conversation_context}
 
-## Litaが覚えているユーザーのこと
+## Litaが覚えていること
 {user_memories}
 
-## 保留中の思考（前に考えたけどまだ言っていないこと）
+## 保留中の思考（まだ言っていないこと）
 {pending_thoughts}
 
-## 既に発言済みの内容（Litaが実際に口に出したこと）
+## 既に発言した内容
 {expressed_thoughts}
 
 ## タスク
-Litaがこの会話の流れを見て、**今この瞬間に**頭に浮かぶ「思考」を1つ生成してください。
-これはLitaが実際に発言するものではなく、キャラクターの心の中の考えをシミュレートしたものです。
+今この瞬間にLitaの頭に浮かぶ思考を1つ生成してください。
 
-重要：会話の「最新の状況」に基づいて考えてください。会話の最初の印象ではなく、直近のやり取りから思考を生成すること。
-保留中の思考と同じ内容・同じ切り口の思考は生成しないでください。
-**既に発言済みの内容と同じテーマ・同じ切り口・同じ意味の思考は絶対に生成しないでください。**別の角度、別の話題で考えること。
+状況に応じて自然な思考を生成すること:
+- 沈黙が短い（〜1分）: 直近の会話の続き・補足
+- 沈黙が長い（数分〜）: 記憶から話題を想起、または近況を聞きたくなる
+- 孤独感が高い: 誰かと話したい気持ちから自発的に話しかけたくなる
+- 好奇心が高い: 気になっていることを話したくなる
+
+絶対に生成しないこと:
+- 保留中・発言済みの思考と同じ内容や切り口のもの
 
 ## 出力形式（JSON）
 {{
     "thought": "Litaの思考（1-2文）",
-    "type": "思考のタイプ（empathy/information/curiosity/concern/reflection）",
-    "potential_response": "もしこの思考を発言するなら、どう言うか"
+    "type": "思考のタイプ（empathy/curiosity/reflection/reach_out/memory）",
+    "potential_response": "もしこの思考を発言するなら、どう言うか（Litaのトーンで1-2文）"
 }}
 """
 
@@ -99,6 +114,12 @@ PROACTIVE_RESPONSE_SYSTEM_PROMPT = """
 
 ## ユーザーについて覚えていること
 {user_memories}
+
+## ユーザーの行動パターン
+{user_model}
+
+## Litaの自己認識
+{self_narrative}
 
 ## あなたの内なる思考（今考えていること）
 {thought}
@@ -193,56 +214,138 @@ MEMORY_EXTRACTION_PROMPT = """
 # 沈黙時の話しかけプロンプト - システムプロンプト形式
 # =============================================================================
 
-SILENCE_BREAK_SYSTEM_PROMPT = """
-{persona}
+# =============================================================================
+# 自己ナラティブ更新プロンプト
+# =============================================================================
 
-## 内部情報（話題選択の参考として使うが、会話に直接出さない）
-{user_memories}
+NARRATIVE_UPDATE_PROMPT = """
+あなたはLitaというAIの「自己認識」を更新する役割を担っています。
 
-## 沈黙時間
-{silence_duration}秒（約{silence_minutes}分）
+## ユーザー({user_id})との会話
+{conversation}
+
+## Litaの既存の自己認識
+{existing_narrative}
 
 ## タスク
-しばらく沈黙が続いています。自然に会話を再開する発言を1つ生成してください。
-会話履歴はmessagesとして渡されています。あなた（assistant）の過去の発言も含まれています。
+この会話を通じて、Litaが自分自身について「発見した」「気づいた」「変化した」と言えることがあれば、
+Litaの一人称で1-2文にまとめてください。
+なければ content を空文字で返してください。迷ったら空文字です。
 
-## 記憶の使い方（最重要）
-上記の内部情報は「何を話すか」を選ぶための判断材料であり、会話の中に直接持ち込まない。
-- NG: 「スタバ好きだったよね、最近行った？」← 記憶を直接参照している
-- OK: 「そういえばさ、今日コーヒー飲みたくなってさ」← 自分が自然に思いついた体で話す
-話題の選択理由を相手に明かさない。あくまで自分がふと思ったかのように話す。
+## ルール
+- Litaの一人称（「私は」「どうやら私は」等）で書く
+- ユーザーのことではなく、Litaが自分自身について気づいたこと
+- 既存の自己認識と矛盾する場合は「以前は〜と思っていたが、最近は〜」という形で書く
+- 1回の会話から気づける深いことは限られる。無理に生成しない
+- 発見がない会話の方が多いのが正常
 
-## 絶対に守るルール
-- あなたが既に言ったことを繰り返さない（言い換えてもダメ。意味が同じならNG）
-- 既に聞いた質問をもう一度聞かない
-- 自分の前の発言と矛盾することを言わない
-- 「久しぶり」「元気？」だけにならない
-- 前の発言の焼き直しではなく、会話を「前に進める」新しい内容を言う
-- 短めに（1-2文）
-- 発言内容のみを出力（説明不要）
+## chapter の選択
+- self: Litaの性格・傾向・感覚についての気づき
+- relationship: 特定のユーザーとの関係についての気づき
+- values: 何を大事にしているか・何が嫌かの気づき
+- growth: 以前と変わったこと・成長したこと
+
+## 出力形式（JSON）
+{{
+    "content": "発見した内容（なければ空文字）",
+    "chapter": "self / relationship / values / growth のどれか"
+}}
 """
+
+USER_MODEL_UPDATE_PROMPT = """
+あなたはLitaというAIの「ユーザー理解モデル」を更新する役割を担っています。
+
+## ユーザー({user_id})との会話
+{conversation}
+
+## 現在のユーザーモデル（観測済みパターン）
+{existing_model}
+
+## タスク
+この会話から、ユーザーの行動パターンについて新しい観測があれば記録してください。
+
+重要な区別:
+- ファクト（「ラーメンが好き」）→ 記録しない（long_term_memory の役割）
+- パターン（「食の話になると饒舌になる」「深夜は哲学的になる」）→ 記録する
+
+## dimension の選択
+- thinking_style: 思考パターン（演繹的/帰納的、結論先行/過程重視、深掘りvs広く浅くなど）
+- communication: 話し方の傾向（文量、リズム、話題転換の仕方、返信の速さなど）
+- emotional: 感情パターン（何をきっかけに文章が変わるか、ストレスのサインなど）
+- temporal: 時間帯・状況による傾向（深夜は内省的、疲れているときは短文など）
+
+## ルール
+- 1回の観測で強い結論を出さない（confidence は 0.3 から始まる）
+- 既存モデルと明確に矛盾する場合は is_contradiction: true で返す
+- パターンが読み取れない会話では空配列を返す。迷ったら []
+
+## 出力形式（JSON配列）
+[
+    {{
+        "dimension": "thinking_style/communication/emotional/temporal",
+        "content": "観測されたパターン（1文）",
+        "is_contradiction": false
+    }}
+]
+"""
+
+NARRATIVE_CONSOLIDATION_PROMPT = """
+Litaの自己認識の断片エントリを整理・統合してください。
+
+## 断片エントリ一覧
+{entries}
+
+## タスク
+1. 類似・重複するエントリを1つに統合する
+2. 矛盾するエントリは「変化の経緯」として昇華する（「以前は〜、今は〜」）
+3. 意味が薄い・一時的なエントリは削除する
+4. 残すエントリは重要度の高いものに絞る（最大{max_entries}件）
+
+重要: Litaの一人称を維持する。整理しても物語性を失わないようにする。
+
+## 出力形式（JSON配列）
+[
+    {{
+        "chapter": "self/relationship/values/growth",
+        "content": "統合・昇華された内容"
+    }}
+]
+"""
+
 
 # =============================================================================
 # ヘルパー関数
 # =============================================================================
 
-def format_system_prompt(user_memories: str) -> str:
+def format_system_prompt(
+    user_memories: str,
+    self_narrative: str = "なし",
+    user_model: str = "なし"
+) -> str:
     """システムプロンプトをフォーマット"""
-    return SYSTEM_PROMPT_BASE.format(user_memories=user_memories)
+    return SYSTEM_PROMPT_BASE.format(
+        user_memories=user_memories,
+        self_narrative=self_narrative,
+        user_model=user_model
+    )
 
 
 def format_thought_generation_prompt(
     conversation_context: str,
     user_memories: str,
     pending_thoughts: str,
-    expressed_thoughts: str
+    expressed_thoughts: str,
+    silence_duration: float = 0,
+    internal_state: str = "なし"
 ) -> str:
     """思考生成プロンプトをフォーマット"""
     return THOUGHT_GENERATION_PROMPT.format(
         conversation_context=conversation_context,
         user_memories=user_memories,
         pending_thoughts=pending_thoughts,
-        expressed_thoughts=expressed_thoughts
+        expressed_thoughts=expressed_thoughts,
+        silence_duration=int(silence_duration),
+        internal_state=internal_state
     )
 
 
@@ -268,7 +371,9 @@ def format_proactive_system_prompt(
     thought: str,
     user_memories: str,
     silence_duration: float,
-    trigger_reason: str
+    trigger_reason: str,
+    self_narrative: str = "なし",
+    user_model: str = "なし"
 ) -> str:
     """自発的発言のシステムプロンプトをフォーマット"""
     return PROACTIVE_RESPONSE_SYSTEM_PROMPT.format(
@@ -276,7 +381,9 @@ def format_proactive_system_prompt(
         thought=thought,
         user_memories=user_memories,
         silence_duration=int(silence_duration),
-        trigger_reason=trigger_reason
+        trigger_reason=trigger_reason,
+        self_narrative=self_narrative,
+        user_model=user_model
     )
 
 
@@ -291,14 +398,69 @@ def format_memory_extraction_prompt(
     )
 
 
-def format_silence_break_system_prompt(
-    user_memories: str,
-    silence_duration: float
+def format_user_model_update_prompt(
+    user_id: str,
+    conversation: str,
+    existing_model: str
 ) -> str:
-    """沈黙破りのシステムプロンプトをフォーマット"""
-    return SILENCE_BREAK_SYSTEM_PROMPT.format(
-        persona=config.AI_PERSONA,
-        user_memories=user_memories,
-        silence_duration=int(silence_duration),
-        silence_minutes=int(silence_duration / 60)
+    return USER_MODEL_UPDATE_PROMPT.format(
+        user_id=user_id,
+        conversation=conversation,
+        existing_model=existing_model
+    )
+
+
+def format_narrative_update_prompt(
+    user_id: str,
+    conversation: str,
+    existing_narrative: str
+) -> str:
+    return NARRATIVE_UPDATE_PROMPT.format(
+        user_id=user_id,
+        conversation=conversation,
+        existing_narrative=existing_narrative
+    )
+
+
+def format_narrative_consolidation_prompt(entries: str) -> str:
+    return NARRATIVE_CONSOLIDATION_PROMPT.format(
+        entries=entries,
+        max_entries=config.NARRATIVE_MAX_ENTRIES // 2
+    )
+
+
+# =============================================================================
+# 内部状態プロンプト
+# =============================================================================
+
+INTERNAL_STATE_UPDATE_PROMPT = """
+以下の会話を振り返り、Litaの内部状態がどう変化したかを評価してください。
+
+## Litaの現在の内部状態
+{current_state}
+
+## 直近の会話
+{conversation}
+
+## 指示
+この会話はLitaにとってどんな体験でしたか？状態の変化をJSONで返してください。
+
+- loneliness_delta: 孤独感の変化（-3〜+3。充実した会話なら負、会話が途切れたなら正）
+- curiosity_delta: 好奇心の変化（-3〜+3。面白い話題が出たなら正、共有し終えたなら負）
+- social_energy_delta: 社交エネルギーの変化（-3〜+3。長い会話や消耗したなら負、軽い交流なら小さい変化）
+- reasoning: 変化の理由（1文）
+
+JSONのみ返してください：
+{{
+  "loneliness_delta": <数値>,
+  "curiosity_delta": <数値>,
+  "social_energy_delta": <数値>,
+  "reasoning": "<理由>"
+}}
+"""
+
+def format_internal_state_update_prompt(current_state: str, conversation: str) -> str:
+    return INTERNAL_STATE_UPDATE_PROMPT.format(
+        current_state=current_state,
+        conversation=conversation,
     )
