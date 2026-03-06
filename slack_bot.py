@@ -184,7 +184,7 @@ class ProactiveAISlackBot:
                     name=self._sanitize_reaction_name(decision.reaction)
                 )
                 # short_termにも記録（proactiveループの「last==user」スキップを解除するため）
-                memory.add_message("assistant", f"[reaction: {decision.reaction}]")
+                memory.add_message("assistant", f"[reaction: {decision.reaction}]", is_reaction=True)
                 self.logger.log_ai_response(
                     user_id,
                     f"[reaction: {decision.reaction}]",
@@ -245,15 +245,8 @@ class ProactiveAISlackBot:
 
             for user_id, memory in list(self.memories.items()):
                 try:
-                    # Reactiveが未応答のユーザーメッセージがある場合はスキップ（二重応答防止）
-                    if memory.short_term and memory.short_term[-1].role == "user":
-                        continue
-
-                    result = await self.engine.process_proactive_cycle(memory, self.narrative)
-                    if result is None:
-                        continue
-
-                    # passive drift 適用後の内部状態をログ
+                    # 時間経過による内部状態の変化（発言可否に関わらず常に適用）
+                    memory.internal_state.apply_passive_drift()
                     s = memory.internal_state.state
                     self.logger.log_internal_state(
                         user_id=user_id,
@@ -262,6 +255,14 @@ class ProactiveAISlackBot:
                         social_energy=s.social_energy,
                         trigger="passive_drift",
                     )
+
+                    # Reactiveが未応答のユーザーメッセージがある場合はスキップ（二重応答防止）
+                    if memory.short_term and memory.short_term[-1].role == "user":
+                        continue
+
+                    result = await self.engine.process_proactive_cycle(memory, self.narrative)
+                    if result is None:
+                        continue
 
                     # 思考ログを記録（発言の有無に関わらず）
                     if result.get("thought_content"):

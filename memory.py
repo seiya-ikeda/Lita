@@ -371,8 +371,13 @@ class MemoryManager:
     # 短期記憶操作
     # =========================================================================
     
-    def add_message(self, role: str, content: str):
-        """メッセージを短期記憶に追加"""
+    def add_message(self, role: str, content: str, is_reaction: bool = False):
+        """メッセージを短期記憶に追加
+
+        is_reaction=True のとき consecutive_ai_messages をカウントしない。
+        リアクションはユーザーメッセージへの直接応答なので、
+        自発的な連続発言とはみなさない。
+        """
         message = Message(
             role=role,
             content=content,
@@ -380,15 +385,15 @@ class MemoryManager:
             user_id=self.user_id
         )
         self.short_term.append(message)
-        
+
         # 発言時刻の更新
         if role == "user":
             self.last_user_message_time = datetime.now()
             self.consecutive_ai_messages = 0
-        else:
+        elif not is_reaction:
             self.last_ai_message_time = datetime.now()
             self.consecutive_ai_messages += 1
-        
+
         return message
     
     def get_conversation_history(self, n: Optional[int] = None) -> list[dict]:

@@ -451,9 +451,6 @@ class InnerThoughtsEngine:
         if not memory.can_intervene():
             return None
 
-        # 受動的ドリフトを適用（内部状態を時間経過で更新）
-        memory.internal_state.apply_passive_drift()
-
         silence = memory.get_silence_duration()
         trigger_reason = f"periodic ({int(silence)}s since last message)"
 
