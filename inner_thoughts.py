@@ -81,6 +81,7 @@ class InnerThoughtsEngine:
         try:
             response = await self.client.chat.completions.create(
                 model=config.LLM_MODEL,
+                temperature=config.LLM_TEMPERATURE,
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -111,15 +112,17 @@ class InnerThoughtsEngine:
     # =========================================================================
     
     async def evaluate_motivation(
-        self, 
-        thought_content: str, 
-        memory: MemoryManager
+        self,
+        thought_content: str,
+        memory: MemoryManager,
+        potential_response: str = ""
     ) -> dict:
         """
         思考の動機づけスコアを評価
         """
         prompt = prompts.format_motivation_evaluation_prompt(
             thought=thought_content,
+            potential_response=potential_response,
             conversation_context=memory.get_context_summary(),
             silence_duration=memory.get_silence_duration(),
             consecutive_ai_messages=memory.consecutive_ai_messages,
@@ -129,6 +132,7 @@ class InnerThoughtsEngine:
         try:
             response = await self.client.chat.completions.create(
                 model=config.LLM_MODEL,
+                temperature=config.LLM_TEMPERATURE,
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -182,6 +186,7 @@ class InnerThoughtsEngine:
             openai_messages = [{"role": "system", "content": system_prompt}] + messages
             response = await self.client.chat.completions.create(
                 model=config.LLM_MODEL,
+                temperature=config.LLM_TEMPERATURE,
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS,
                 messages=openai_messages
             )
@@ -216,6 +221,7 @@ class InnerThoughtsEngine:
             openai_messages = [{"role": "system", "content": system_prompt}] + messages
             response = await self.client.chat.completions.create(
                 model=config.LLM_MODEL,
+                temperature=config.LLM_TEMPERATURE,
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS,
                 messages=openai_messages
             )
@@ -255,6 +261,7 @@ class InnerThoughtsEngine:
         try:
             response = await self.client.chat.completions.create(
                 model=config.LLM_MODEL,
+                temperature=config.LLM_TEMPERATURE,
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -500,13 +507,13 @@ class InnerThoughtsEngine:
 
         thought, potential_response = result
 
-        # 動機づけ評価
-        evaluation = await self.evaluate_motivation(thought.content, memory)
+        # 動機づけ評価（potential_responseも渡して焼き直し検出を正確にする）
+        evaluation = await self.evaluate_motivation(thought.content, memory, potential_response)
 
         # 思考をリザーバーに保存
         thought.motivation_score = evaluation.get("overall_score", 0)
         thought.reasoning = evaluation.get("reasoning", "")
-        memory.add_thought(
+        reservoir_thought = memory.add_thought(
             content=thought.content,
             motivation_score=thought.motivation_score,
             reasoning=thought.reasoning,
@@ -523,7 +530,7 @@ class InnerThoughtsEngine:
                     thought, potential_response, memory, trigger_reason, narrative
                 )
                 if response:
-                    thought.expressed = True
+                    reservoir_thought.expressed = True
                     was_expressed = True
 
         # 思考データは発言の有無に関わらず返す（ログ用）

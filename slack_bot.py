@@ -302,6 +302,10 @@ class ProactiveAISlackBot:
                     # 発言がある場合のみ送信
                     response = result.get("response")
                     if response:
+                        # 重複チェック: 直近のassistant発言と同一なら送らない
+                        recent_ai = [m.content for m in list(memory.short_term)[-5:] if m.role == "assistant"]
+                        if response in recent_ai:
+                            continue
                         channel = self.user_channels.get(user_id)
                         if channel:
                             memory.add_message("assistant", response)
