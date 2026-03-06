@@ -3,6 +3,7 @@ Proactive AI Friend - Response Classifier
 メッセージに対してリアクション/返信/無視を判定する
 """
 
+import random
 from openai import AsyncOpenAI
 from typing import Optional
 from dataclasses import dataclass
@@ -37,9 +38,10 @@ class ResponseClassifier:
         )
     
     async def classify(
-        self, 
-        message: str, 
-        conversation_context: str = ""
+        self,
+        message: str,
+        conversation_context: str = "",
+        custom_emojis: list[str] = []
     ) -> ResponseDecision:
         """
         メッセージの応答タイプを判定
@@ -79,7 +81,8 @@ class ResponseClassifier:
 ## リアクション絵文字について
 actionがreactの場合、そのメッセージの感情・文脈に一番フィットするSlack絵文字名を選ぶ。
 thumbsupなどに偏らず、状況に応じて多様な絵文字を使うこと。
-（Slackで使える絵文字名なら何でもOK）
+{f"このワークスペースのカスタム絵文字（名前から意味を推測して積極的に使ってOK）: {', '.join(random.sample(custom_emojis, min(50, len(custom_emojis))))}" if custom_emojis else ""}
+標準絵文字（thumbsup, heart, joy, wave など）も使用可能。
 
 ## 出力形式（JSON）
 {{

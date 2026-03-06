@@ -63,6 +63,9 @@ class ProactiveAISlackBot:
         # Bot自身のユーザーID（起動時に取得）
         self.bot_user_id: str = ""
 
+        # ワークスペースのカスタム絵文字一覧（起動時に取得）
+        self.custom_emojis: list[str] = []
+
         # イベントハンドラとコマンドを登録
         self._register_handlers()
 
@@ -179,7 +182,7 @@ class ProactiveAISlackBot:
 
             # 応答タイプを判定（add_message前にコンテキストを取得し、現在のメッセージが混入しないようにする）
             context = memory.get_context_summary()
-            decision = await self.classifier.classify(content, context)
+            decision = await self.classifier.classify(content, context, custom_emojis=self.custom_emojis)
 
             # ユーザーメッセージを記録
             memory.add_message("user", content)
@@ -194,8 +197,16 @@ class ProactiveAISlackBot:
                         name=self._sanitize_reaction_name(decision.reaction)
                     )
                 except SlackApiError as e:
-                    if e.response["error"] == "message_not_found":
+                    err = e.response["error"]
+                    if err == "message_not_found":
                         print(f"[Reaction] Message already deleted, skipping: ts={ts}")
+                        return
+                    if err == "invalid_name":
+                        # LLMが存在しない絵文字名を返した場合はthumbsupで再試行
+                        try:
+                            await client.reactions_add(channel=channel, timestamp=ts, name="thumbsup")
+                        except SlackApiError:
+                            pass
                         return
                     raise
                 # short_termにも記録（proactiveループの「last==user」スキップを解除するため）
@@ -705,6 +716,14 @@ class ProactiveAISlackBot:
         # Bot自身のユーザーIDを取得
         auth = await self.app.client.auth_test()
         self.bot_user_id = auth["user_id"]
+
+        # カスタム絵文字を取得（emoji:read スコープが必要）
+        try:
+            emoji_resp = await self.app.client.emoji_list()
+            self.custom_emojis = list(emoji_resp.get("emoji", {}).keys())
+            print(f"Custom emojis loaded: {len(self.custom_emojis)}")
+        except Exception as e:
+            print(f"[Emoji] Failed to load custom emojis: {e}")
 
         print(f"{config.AI_NAME} がオンラインになりました！ (Slack)")
         print(f"Session ID: {self.session_id}")
