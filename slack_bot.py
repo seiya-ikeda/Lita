@@ -12,6 +12,7 @@ from typing import Optional
 
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+from slack_sdk.errors import SlackApiError
 
 import config
 from memory import MemoryManager, SelfNarrative
@@ -144,6 +145,13 @@ class ProactiveAISlackBot:
         channel_type = event.get("channel_type", "")
         ts = event.get("ts", "")
 
+        # 古すぎるイベントは無視（再起動時の再送対策）
+        if ts:
+            import time
+            event_age = time.time() - float(ts)
+            if event_age > 120:
+                return
+
         # DMまたはメンションされた場合のみ反応
         is_dm = channel_type == "im"
         is_mentioned = f"<@{self.bot_user_id}>" in text
@@ -179,11 +187,17 @@ class ProactiveAISlackBot:
 
             if decision.action == "react" and decision.reaction:
                 # リアクションで十分な場合
-                await client.reactions_add(
-                    channel=channel,
-                    timestamp=ts,
-                    name=self._sanitize_reaction_name(decision.reaction)
-                )
+                try:
+                    await client.reactions_add(
+                        channel=channel,
+                        timestamp=ts,
+                        name=self._sanitize_reaction_name(decision.reaction)
+                    )
+                except SlackApiError as e:
+                    if e.response["error"] == "message_not_found":
+                        print(f"[Reaction] Message already deleted, skipping: ts={ts}")
+                        return
+                    raise
                 # short_termにも記録（proactiveループの「last==user」スキップを解除するため）
                 memory.add_message("assistant", f"[reaction: {decision.reaction}]", is_reaction=True)
                 self.logger.log_ai_response(

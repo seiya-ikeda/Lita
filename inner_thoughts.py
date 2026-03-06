@@ -55,12 +55,17 @@ class InnerThoughtsEngine:
             for t in pending
         ]) if pending else "なし"
 
-        # 発言済みの思考
+        # 発言済みの思考（thought_reservoir + short_termのassistant発言を合算）
         expressed = memory.get_expressed_thoughts()
-        expressed_thoughts = "\n".join([
-            f"- {t.content}"
-            for t in expressed
-        ]) if expressed else "なし"
+        expressed_lines = [f"- {t.content}" for t in expressed]
+        # reactive responseはthought_reservoirに入らないため、short_termからも補完
+        recent_assistant = [
+            f"- {m.content}"
+            for m in list(memory.short_term)[-10:]
+            if m.role == "assistant"
+        ]
+        all_expressed = expressed_lines + [l for l in recent_assistant if l not in expressed_lines]
+        expressed_thoughts = "\n".join(all_expressed) if all_expressed else "なし"
 
         # プロンプト生成
         prompt = prompts.format_thought_generation_prompt(
