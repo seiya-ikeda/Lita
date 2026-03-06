@@ -5,6 +5,7 @@ Proactive AI Friend - Inner Thoughts Engine
 
 import json
 import re
+from datetime import datetime
 from typing import Optional
 from openai import AsyncOpenAI
 
@@ -39,7 +40,7 @@ class InnerThoughtsEngine:
     # ステージ2 & 3: Retrieval + Thought Formation（記憶取得 + 思考生成）
     # =========================================================================
 
-    async def generate_thought(self, memory: MemoryManager, trigger_reason: str) -> Optional[Thought]:
+    async def generate_thought(self, memory: MemoryManager, trigger_reason: str, trigger_type: str = "conversation") -> Optional[Thought]:
         """
         内なる思考を生成
         """
@@ -68,7 +69,8 @@ class InnerThoughtsEngine:
             pending_thoughts=pending_thoughts,
             expressed_thoughts=expressed_thoughts,
             silence_duration=memory.get_silence_duration(),
-            internal_state=memory.internal_state.get_prompt_context()
+            internal_state=memory.internal_state.get_prompt_context(),
+            trigger_type=trigger_type
         )
         
         try:
@@ -197,7 +199,9 @@ class InnerThoughtsEngine:
         system_prompt = prompts.format_system_prompt(
             user_memories=memory.get_all_memories_summary(),
             self_narrative=narrative.get_summary() if narrative else "なし",
-            user_model=memory.get_user_model_summary()
+            user_model=memory.get_user_model_summary(),
+            current_time=datetime.now().strftime("%Y年%m月%d日 %H:%M (%A)"),
+            internal_state=memory.internal_state.get_prompt_context()
         )
         
         messages = memory.get_conversation_history()
@@ -302,10 +306,19 @@ class InnerThoughtsEngine:
                 return None
 
             chapter = result.get("chapter", "self")
+            is_contradiction = result.get("is_contradiction", False)
+            contradicts_content = result.get("contradicts_content", "").strip()
+
+            # 矛盾する既存エントリのconfidenceを下げる
+            if is_contradiction and contradicts_content:
+                narrative.weaken(chapter, contradicts_content)
+                print(f"[Narrative] Weakened [{chapter}]: {contradicts_content[:60]}")
+
             entry = narrative.add_entry(
                 content=content,
                 chapter=chapter,
-                related_user=memory.user_id
+                related_user=memory.user_id,
+                contradicts=contradicts_content if is_contradiction else None
             )
             print(f"[Narrative] New entry [{chapter}]: {content[:80]}")
             return entry
@@ -314,11 +327,10 @@ class InnerThoughtsEngine:
             print(f"Narrative update error: {e}")
             return None
 
-    async def update_user_model(self, memory: MemoryManager) -> int:
+    async def update_user_model(self, memory: MemoryManager) -> list[dict]:
         """
         会話からユーザーの行動パターンを抽出してモデルを更新する。
-        ファクトではなくパターン（傾向・スタイル）に注目する。
-        更新したエントリ数を返す。
+        更新したエントリの情報リストを返す（research_log用）。
         """
         conversation = "\n".join([
             f"{'ユーザー' if m['role'] == 'user' else config.AI_NAME}: {m['content']}"
@@ -339,9 +351,9 @@ class InnerThoughtsEngine:
             )
             result = self._extract_json(response.choices[0].message.content or "")
             if not isinstance(result, list):
-                return 0
+                return []
 
-            count = 0
+            updated = []
             for item in result:
                 dimension = item.get("dimension", "communication")
                 content = item.get("content", "").strip()
@@ -350,48 +362,70 @@ class InnerThoughtsEngine:
                     continue
                 if is_contradiction:
                     memory.user_model.weaken(dimension, content)
+                    # weaken後のconfidenceを取得
+                    conf = next(
+                        (e.confidence for e in memory.user_model.entries
+                         if e.dimension == dimension and memory.user_model._similar(e.content, content)),
+                        0.0
+                    )
                 else:
-                    memory.user_model.add_or_update(dimension, content)
-                    count += 1
+                    entry = memory.user_model.add_or_update(dimension, content)
+                    conf = entry.confidence
+                updated.append({
+                    "dimension": dimension,
+                    "content": content,
+                    "is_contradiction": is_contradiction,
+                    "confidence_after": conf,
+                })
 
-            if count:
-                print(f"[UserModel] {count} entries updated for {memory.user_id}")
-            return count
+            if updated:
+                print(f"[UserModel] {len(updated)} entries updated for {memory.user_id}")
+            return updated
 
         except Exception as e:
             print(f"User model update error: {e}")
-            return 0
+            return []
 
-    async def consolidate_narrative(self, narrative: SelfNarrative) -> bool:
+    async def summarize_session(self, memory: MemoryManager) -> bool:
         """
-        週次整理: 断片エントリを統合・圧縮（睡眠サイクル）。
-        矛盾は「変化の経緯」として昇華し、意味の薄いエントリは削除する。
+        睡眠時: 今日の会話をサマリーしてlong_termに書き込む（LD-Agent式）。
+        short_termが空の場合はスキップ。
         """
-        if len(narrative.entries) < 3:
+        history = memory.get_conversation_history()
+        if not history:
             return False
 
-        entries_text = "\n".join([
-            f"[{e.chapter}] {e.content}"
-            for e in narrative.entries
+        conversation = "\n".join([
+            f"{'ユーザー' if m['role'] == 'user' else config.AI_NAME}: {m['content']}"
+            for m in history
         ])
-
-        prompt = prompts.format_narrative_consolidation_prompt(entries=entries_text)
+        prompt = prompts.format_session_summary_prompt(
+            user_id=memory.user_id,
+            conversation=conversation
+        )
 
         try:
             response = await self.client.chat.completions.create(
                 model=config.LLM_MODEL,
-                max_completion_tokens=1024,
+                max_completion_tokens=256,
                 messages=[{"role": "user", "content": prompt}]
             )
             result = self._extract_json(response.choices[0].message.content or "")
-            if isinstance(result, list) and result:
-                narrative.replace_all(result)
-                print(f"[Narrative] Consolidated: {len(narrative.entries)} entries")
-                return True
-            return False
+            summary = result.get("summary", "").strip() if isinstance(result, dict) else ""
+            if not summary:
+                return False
+
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            memory.add_long_term_memory(
+                key=f"session_summary_{date_str}",
+                content=summary,
+                importance=3.0
+            )
+            print(f"[Sleep] Session summary saved for {memory.user_id}: {summary[:60]}")
+            return True
 
         except Exception as e:
-            print(f"Narrative consolidation error: {e}")
+            print(f"Session summary error: {e}")
             return False
 
     # =========================================================================
@@ -438,7 +472,7 @@ class InnerThoughtsEngine:
     # メインの処理フロー
     # =========================================================================
 
-    async def process_proactive_cycle(self, memory: MemoryManager, narrative: Optional[SelfNarrative] = None) -> Optional[dict]:
+    async def process_proactive_cycle(self, memory: MemoryManager, narrative: Optional[SelfNarrative] = None, trigger_type: str = "conversation") -> Optional[dict]:
         """
         Proactiveサイクルの実行：思考生成 → ブレーキ評価 → 発話
 
@@ -452,10 +486,10 @@ class InnerThoughtsEngine:
             return None
 
         silence = memory.get_silence_duration()
-        trigger_reason = f"periodic ({int(silence)}s since last message)"
+        trigger_reason = f"{trigger_type} ({int(silence)}s since last message)"
 
         # 思考生成（沈黙時間・内部状態をコンテキストとして渡す）
-        result = await self.generate_thought(memory, trigger_reason)
+        result = await self.generate_thought(memory, trigger_reason, trigger_type=trigger_type)
         if not result:
             return None
 
@@ -492,6 +526,7 @@ class InnerThoughtsEngine:
             "response": response,
             "thought_content": thought.content,
             "trigger_reason": trigger_reason,
+            "trigger_type": trigger_type,
             "motivation_score": thought.motivation_score,
             "evaluation": evaluation,
             "was_expressed": was_expressed,

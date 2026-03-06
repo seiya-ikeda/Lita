@@ -63,6 +63,8 @@ class NarrativeEntry:
     content: str   # Litaの一人称で書かれた物語断片
     related_user: str
     contradicts: Optional[str] = None  # 矛盾する過去エントリのID
+    confidence: float = 0.3            # 0.0-1.0（繰り返し確認で上昇、矛盾で下降）
+    observation_count: int = 1
 
     def to_dict(self):
         return asdict(self)
@@ -184,11 +186,15 @@ class SelfNarrative:
         self._load()
 
     def get_summary(self, max_entries: int = 8) -> str:
-        """プロンプトに渡す自己認識サマリー"""
+        """プロンプトに渡す自己認識サマリー（confidence順）"""
         if not self.entries:
             return "なし"
-        recent = self.entries[-max_entries:]
-        return "\n".join([f"[{e.chapter}] {e.content}" for e in recent])
+        sorted_entries = sorted(self.entries, key=lambda e: e.confidence, reverse=True)
+        top = sorted_entries[:max_entries]
+        return "\n".join([
+            f"[{e.chapter}|{'確信' if e.confidence >= 0.7 else '形成中'}] {e.content}"
+            for e in top
+        ])
 
     def add_entry(
         self,
@@ -197,6 +203,15 @@ class SelfNarrative:
         related_user: str,
         contradicts: Optional[str] = None
     ) -> NarrativeEntry:
+        """新規エントリを追加。類似内容があればconfidenceを上げる。"""
+        for entry in self.entries:
+            if entry.chapter == chapter and self._similar(entry.content, content):
+                entry.confidence = min(1.0, entry.confidence + 0.1)
+                entry.observation_count += 1
+                entry.timestamp = datetime.now().isoformat()
+                self._save()
+                return entry
+
         entry = NarrativeEntry(
             id=datetime.now().isoformat(),
             timestamp=datetime.now().isoformat(),
@@ -206,10 +221,26 @@ class SelfNarrative:
             contradicts=contradicts
         )
         self.entries.append(entry)
+        # confidence最低のものを削除してmax以内に収める
         if len(self.entries) > config.NARRATIVE_MAX_ENTRIES:
-            self.entries = self.entries[-config.NARRATIVE_MAX_ENTRIES:]
+            lowest = min(self.entries, key=lambda e: e.confidence)
+            self.entries.remove(lowest)
         self._save()
         return entry
+
+    def weaken(self, chapter: str, content: str, amount: float = 0.15):
+        """矛盾する観測があった場合にconfidenceを下げる"""
+        for entry in self.entries:
+            if entry.chapter == chapter and self._similar(entry.content, content):
+                entry.confidence = max(0.0, entry.confidence - amount)
+                self._save()
+                return
+
+    def _similar(self, a: str, b: str) -> bool:
+        """単語の重複で簡易的な類似判定"""
+        words_a = set(a.lower().split())
+        words_b = set(b.lower().split())
+        return len(words_a & words_b) >= 3
 
     def replace_all(self, entries: list[dict]):
         """週次整理後にエントリを置き換え"""
@@ -236,7 +267,10 @@ class SelfNarrative:
         if os.path.exists(self.STORAGE_PATH):
             with open(self.STORAGE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                self.entries = [NarrativeEntry(**e) for e in data]
+                self.entries = [
+                    NarrativeEntry(**{k: v for k, v in e.items() if k in NarrativeEntry.__dataclass_fields__})
+                    for e in data
+                ]
 
 
 @dataclass
@@ -555,16 +589,17 @@ class MemoryManager:
     
     def can_intervene(self) -> bool:
         """AIが自発的に発言できるかチェック"""
-        # 連続発言制限
-        if self.consecutive_ai_messages >= config.MAX_CONSECUTIVE_INTERVENTIONS:
-            return False
-        
         # 最小間隔チェック
         if self.last_ai_message_time:
             elapsed = (datetime.now() - self.last_ai_message_time).total_seconds()
             if elapsed < config.MIN_INTERVENTION_INTERVAL:
                 return False
-        
+        # ハード停止: 長時間無返答継続（ComPeer-inspired）
+        if self.consecutive_ai_messages >= config.UNANSWERED_COUNT_THRESHOLD:
+            if self.last_user_message_time:
+                silence = (datetime.now() - self.last_user_message_time).total_seconds()
+                if silence >= config.UNANSWERED_SILENCE_THRESHOLD:
+                    return False
         return True
     
     # =========================================================================

@@ -39,6 +39,30 @@ class ThoughtLog:
 
 
 @dataclass
+class UserModelLog:
+    """ユーザーモデル更新ログ"""
+    timestamp: str
+    session_id: str
+    user_id: str
+    dimension: str
+    content: str
+    is_contradiction: bool
+    confidence_after: float
+
+
+@dataclass
+class NarrativeLog:
+    """自己ナラティブ更新ログ"""
+    timestamp: str
+    session_id: str
+    user_id: str
+    chapter: str         # "self" / "relationship" / "values" / "growth"
+    content: str
+    contradicts: Optional[str]   # 矛盾した過去エントリのID（なければNone）
+    total_entries: int           # 更新後のナラティブ総エントリ数
+
+
+@dataclass
 class InternalStateLog:
     """内部状態ログエントリ"""
     timestamp: str
@@ -89,6 +113,8 @@ class ResearchLogger:
         os.makedirs(f"{self.log_dir}/thoughts", exist_ok=True)
         os.makedirs(f"{self.log_dir}/metrics", exist_ok=True)
         os.makedirs(f"{self.log_dir}/internal_state", exist_ok=True)
+        os.makedirs(f"{self.log_dir}/narrative", exist_ok=True)
+        os.makedirs(f"{self.log_dir}/user_model", exist_ok=True)
         
         # セッション内のログ
         self.conversation_logs: list[ConversationLog] = []
@@ -207,6 +233,54 @@ class ResearchLogger:
             reasoning=reasoning,
         )
         self._append_to_csv("internal_state", log)
+
+    # =========================================================================
+    # ユーザーモデルログ
+    # =========================================================================
+
+    def log_user_model_update(
+        self,
+        user_id: str,
+        dimension: str,
+        content: str,
+        is_contradiction: bool,
+        confidence_after: float,
+    ):
+        """ユーザーモデル更新をログ"""
+        log = UserModelLog(
+            timestamp=datetime.now().isoformat(),
+            session_id=self.session_id,
+            user_id=user_id,
+            dimension=dimension,
+            content=content,
+            is_contradiction=is_contradiction,
+            confidence_after=confidence_after,
+        )
+        self._append_to_csv("user_model", log)
+
+    # =========================================================================
+    # ナラティブログ
+    # =========================================================================
+
+    def log_narrative_update(
+        self,
+        user_id: str,
+        chapter: str,
+        content: str,
+        contradicts: Optional[str],
+        total_entries: int,
+    ):
+        """自己ナラティブ更新をログ"""
+        log = NarrativeLog(
+            timestamp=datetime.now().isoformat(),
+            session_id=self.session_id,
+            user_id=user_id,
+            chapter=chapter,
+            content=content,
+            contradicts=contradicts,
+            total_entries=total_entries,
+        )
+        self._append_to_csv("narrative", log)
 
     # =========================================================================
     # 指標計算

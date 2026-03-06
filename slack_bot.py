@@ -4,9 +4,10 @@ Inner ThoughtsフレームワークをSlackに移植
 """
 
 import asyncio
+import random
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from slack_bolt.async_app import AsyncApp
@@ -221,11 +222,6 @@ class ProactiveAISlackBot:
             if len(memory.short_term) >= 5 and len(memory.short_term) % 5 <= 1:
                 await self._extract_and_save_memories(memory)
 
-            # 自己ナラティブ + ユーザーモデル更新（10ターンごと）
-            if len(memory.short_term) >= 10 and len(memory.short_term) % 10 <= 1:
-                await self._update_narrative(memory)
-                await self._update_user_model(memory)
-
             # 内部状態更新（5ターンごと）
             if len(memory.short_term) >= config.INTERNAL_STATE_UPDATE_INTERVAL and \
                len(memory.short_term) % config.INTERNAL_STATE_UPDATE_INTERVAL <= 1:
@@ -260,7 +256,13 @@ class ProactiveAISlackBot:
                     if memory.short_term and memory.short_term[-1].role == "user":
                         continue
 
-                    result = await self.engine.process_proactive_cycle(memory, self.narrative)
+                    # トリガータイプをランダムに選択（多様性確保）
+                    # conversation:40% / memory_recall:35% / self_thought:25%
+                    trigger_type = random.choices(
+                        ["conversation", "memory_recall", "self_thought"],
+                        weights=[40, 35, 25]
+                    )[0]
+                    result = await self.engine.process_proactive_cycle(memory, self.narrative, trigger_type=trigger_type)
                     if result is None:
                         continue
 
@@ -297,15 +299,86 @@ class ProactiveAISlackBot:
                 except Exception as e:
                     print(f"Proactive cycle error for {user_id}: {e}")
 
-    async def _narrative_consolidation_loop(self):
-        """週次: ナラティブを整理・統合（睡眠サイクル）"""
+    async def _info_gather_loop(self):
+        """定期的にユーザーの興味に合った情報を収集し、自然に共有する"""
         while True:
-            await asyncio.sleep(config.NARRATIVE_CONSOLIDATION_INTERVAL)
+            await asyncio.sleep(config.SEARCH_INTERVAL)
+
+            for user_id, memory in list(self.memories.items()):
+                if not config.ENABLE_INFORMATION_GATHERING:
+                    break
+                try:
+                    result = await self.info_gatherer.find_shareable_article(memory)
+                    if not result:
+                        continue
+
+                    article, message = result
+                    channel = self.user_channels.get(user_id)
+                    if not channel:
+                        continue
+
+                    # 発言可否チェック（最小間隔）
+                    if not memory.can_intervene():
+                        continue
+
+                    memory.add_message("assistant", message)
+                    self.logger.log_ai_response(
+                        user_id, message, is_proactive=True,
+                        metadata={"trigger": "info_share", "article_url": article.url}
+                    )
+                    await self.app.client.chat_postMessage(channel=channel, text=message)
+                    print(f"[InfoGather] Shared to {user_id}: {article.title[:50]}")
+
+                except Exception as e:
+                    print(f"Info gather loop error for {user_id}: {e}")
+
+    async def _daily_sleep_loop(self):
+        """毎日0時: 睡眠サイクル（narrative更新・session summary・short_termリセット）"""
+        while True:
+            now = datetime.now()
+            # 次の0時までの秒数を計算
+            next_midnight = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            await asyncio.sleep((next_midnight - now).total_seconds())
+
+            print("[Sleep] Starting daily sleep cycle...")
             try:
-                print("[Narrative] Starting weekly consolidation...")
-                await self.engine.consolidate_narrative(self.narrative)
+                for user_id, memory in self.memories.items():
+                    if not memory.short_term:
+                        continue
+                    # セッションサマリーをlong_termへ
+                    await self.engine.summarize_session(memory)
+                    # ナラティブ・ユーザーモデル更新
+                    entry = await self.engine.update_self_narrative(memory, self.narrative)
+                    if entry:
+                        self.logger.log_narrative_update(
+                            user_id=user_id,
+                            chapter=entry.chapter,
+                            content=entry.content,
+                            contradicts=entry.contradicts,
+                            total_entries=len(self.narrative.entries),
+                        )
+                    user_model_updates = await self.engine.update_user_model(memory)
+                    for upd in user_model_updates:
+                        self.logger.log_user_model_update(
+                            user_id=user_id,
+                            dimension=upd["dimension"],
+                            content=upd["content"],
+                            is_contradiction=upd["is_contradiction"],
+                            confidence_after=upd["confidence_after"],
+                        )
+                    # short_termをクリア
+                    memory.short_term.clear()
+                    print(f"[Sleep] Done for {user_id}")
+
+                # session_idを更新
+                self.session_id = str(uuid.uuid4())[:8]
+                self.logger = ResearchLogger(self.session_id)
+                print(f"[Sleep] New session: {self.session_id}")
+
             except Exception as e:
-                print(f"Narrative consolidation loop error: {e}")
+                print(f"Daily sleep loop error: {e}")
 
 
     # =========================================================================
@@ -444,8 +517,7 @@ class ProactiveAISlackBot:
             f"*Proactive Settings*\n"
             f"- Motivation threshold: {config.MOTIVATION_THRESHOLD}\n"
             f"- Thought interval: {config.THOUGHT_GENERATION_INTERVAL}s\n"
-            f"- Min intervention interval: {config.MIN_INTERVENTION_INTERVAL}s\n"
-            f"- Max consecutive: {config.MAX_CONSECUTIVE_INTERVENTIONS}\n\n"
+            f"- Min intervention interval: {config.MIN_INTERVENTION_INTERVAL}s\n\n"
             f"*Information Gathering*\n"
             f"- Enabled: {config.ENABLE_INFORMATION_GATHERING}\n"
             f"- Search interval: {config.SEARCH_INTERVAL}s\n"
@@ -596,21 +668,6 @@ class ProactiveAISlackBot:
         except Exception as e:
             print(f"Memory extraction error: {e}")
 
-    async def _update_narrative(self, memory: MemoryManager):
-        """自己ナラティブを更新"""
-        try:
-            entry = await self.engine.update_self_narrative(memory, self.narrative)
-            if entry:
-                print(f"[Narrative] Updated for user {memory.user_id}")
-        except Exception as e:
-            print(f"Narrative update error: {e}")
-
-    async def _update_user_model(self, memory: MemoryManager):
-        """ユーザーモデルを更新"""
-        try:
-            await self.engine.update_user_model(memory)
-        except Exception as e:
-            print(f"User model update error: {e}")
 
     async def _update_internal_state(self, memory: MemoryManager):
         """内部状態を更新"""
@@ -644,9 +701,10 @@ class ProactiveAISlackBot:
         print("-" * 50)
 
         # バックグラウンドタスクを起動
+        asyncio.create_task(self._daily_sleep_loop())
         if config.EXPERIMENT_CONDITION == "proactive":
             asyncio.create_task(self._proactive_loop())
-            asyncio.create_task(self._narrative_consolidation_loop())
+            asyncio.create_task(self._info_gather_loop())
 
 
         # Socket Modeで接続

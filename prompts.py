@@ -12,6 +12,12 @@ import config
 SYSTEM_PROMPT_BASE = f"""
 {config.AI_PERSONA}
 
+## 現在の日時
+{{current_time}}
+
+## Litaの今の気持ち（このユーザーとの関係における内部状態）
+{{internal_state}}
+
 ## ユーザーについて覚えていること
 {{user_memories}}
 
@@ -29,6 +35,7 @@ SYSTEM_PROMPT_BASE = f"""
 - 自分（assistant）が既に言ったことを繰り返さない（言い換えてもダメ。意味が同じならNG）
 - 自分の前の発言と矛盾することを言わない
 - ユーザーの最新メッセージの内容にちゃんと応答する。話を無視して自分の話だけしない
+- 時間帯に合った話題・挨拶を心がける（朝に「おはよう」、深夜には無理に明るくしない、など）
 """
 
 # =============================================================================
@@ -55,25 +62,37 @@ THOUGHT_GENERATION_PROMPT = """
 ## 既に発言した内容
 {expressed_thoughts}
 
-## タスク
-今この瞬間にLitaの頭に浮かぶ思考を1つ生成してください。
+## 今回の思考のトリガー
+{trigger_instruction}
 
-状況に応じて自然な思考を生成すること:
-- 沈黙が短い（〜1分）: 直近の会話の続き・補足
-- 沈黙が長い（数分〜）: 記憶から話題を想起、または近況を聞きたくなる
-- 孤独感が高い: 誰かと話したい気持ちから自発的に話しかけたくなる
-- 好奇心が高い: 気になっていることを話したくなる
-
-絶対に生成しないこと:
+## 絶対に生成しないこと
 - 保留中・発言済みの思考と同じ内容や切り口のもの
 
 ## 出力形式（JSON）
 {{
     "thought": "Litaの思考（1-2文）",
-    "type": "思考のタイプ（empathy/curiosity/reflection/reach_out/memory）",
+    "type": "思考のタイプ（empathy/curiosity/reflection/reach_out/memory/self）",
     "potential_response": "もしこの思考を発言するなら、どう言うか（Litaのトーンで1-2文）"
 }}
 """
+
+# trigger_instruction のバリエーション（_proactive_loop でランダムに選ぶ）
+TRIGGER_INSTRUCTIONS = {
+    "conversation": (
+        "直近の会話の流れから自然に浮かんだ思考を生成してください。"
+        "会話の続き・補足・感想など。沈黙が長ければ近況確認でもOK。"
+    ),
+    "memory_recall": (
+        "長期記憶や以前の会話を掘り起こして「そういえば」な思考を生成してください。"
+        "「前に言ってたあれどうなった？」「気になってたんだけど」のような、"
+        "記憶から自然に浮かぶ話題を選ぶこと。"
+    ),
+    "self_thought": (
+        "会話と直接関係なくていい。Lita自身の関心事・感じていること・最近考えていることを"
+        "思考として生成してください。「あ、これ気になってる」「こういうの好きだなって思って」"
+        "のような、Lita自身から出てくる話題。"
+    ),
+}
 
 # =============================================================================
 # 動機づけ評価プロンプト
@@ -235,9 +254,9 @@ Litaの一人称で1-2文にまとめてください。
 ## ルール
 - Litaの一人称（「私は」「どうやら私は」等）で書く
 - ユーザーのことではなく、Litaが自分自身について気づいたこと
-- 既存の自己認識と矛盾する場合は「以前は〜と思っていたが、最近は〜」という形で書く
 - 1回の会話から気づける深いことは限られる。無理に生成しない
 - 発見がない会話の方が多いのが正常
+- 既存の自己認識と矛盾する場合は is_contradiction: true にして、矛盾している既存エントリの内容を contradicts_content に入れる
 
 ## chapter の選択
 - self: Litaの性格・傾向・感覚についての気づき
@@ -248,7 +267,9 @@ Litaの一人称で1-2文にまとめてください。
 ## 出力形式（JSON）
 {{
     "content": "発見した内容（なければ空文字）",
-    "chapter": "self / relationship / values / growth のどれか"
+    "chapter": "self / relationship / values / growth のどれか",
+    "is_contradiction": false,
+    "contradicts_content": "矛盾している既存エントリの内容（is_contradictionがtrueのときのみ、それ以外は空文字）"
 }}
 """
 
@@ -289,27 +310,22 @@ USER_MODEL_UPDATE_PROMPT = """
 ]
 """
 
-NARRATIVE_CONSOLIDATION_PROMPT = """
-Litaの自己認識の断片エントリを整理・統合してください。
+SESSION_SUMMARY_PROMPT = """
+以下はLitaと{user_id}との今日の会話です。
+この会話を、次回以降のセッションでLitaが文脈を思い出すための簡潔なサマリーにしてください。
 
-## 断片エントリ一覧
-{entries}
+## 会話
+{conversation}
 
 ## タスク
-1. 類似・重複するエントリを1つに統合する
-2. 矛盾するエントリは「変化の経緯」として昇華する（「以前は〜、今は〜」）
-3. 意味が薄い・一時的なエントリは削除する
-4. 残すエントリは重要度の高いものに絞る（最大{max_entries}件）
+- 話したトピック、相手の状況・気持ち、重要な出来事を1〜3文にまとめる
+- Litaの一人称視点で書く（「私は〜と話した」「{user_id}は〜と言っていた」など）
+- 感情的なニュアンスや関係性の変化も含める
 
-重要: Litaの一人称を維持する。整理しても物語性を失わないようにする。
-
-## 出力形式（JSON配列）
-[
-    {{
-        "chapter": "self/relationship/values/growth",
-        "content": "統合・昇華された内容"
-    }}
-]
+## 出力形式（JSON）
+{{
+    "summary": "サマリーテキスト"
+}}
 """
 
 
@@ -320,13 +336,17 @@ Litaの自己認識の断片エントリを整理・統合してください。
 def format_system_prompt(
     user_memories: str,
     self_narrative: str = "なし",
-    user_model: str = "なし"
+    user_model: str = "なし",
+    current_time: str = "",
+    internal_state: str = ""
 ) -> str:
     """システムプロンプトをフォーマット"""
     return SYSTEM_PROMPT_BASE.format(
         user_memories=user_memories,
         self_narrative=self_narrative,
-        user_model=user_model
+        user_model=user_model,
+        current_time=current_time,
+        internal_state=internal_state
     )
 
 
@@ -336,16 +356,19 @@ def format_thought_generation_prompt(
     pending_thoughts: str,
     expressed_thoughts: str,
     silence_duration: float = 0,
-    internal_state: str = "なし"
+    internal_state: str = "なし",
+    trigger_type: str = "conversation"
 ) -> str:
     """思考生成プロンプトをフォーマット"""
+    trigger_instruction = TRIGGER_INSTRUCTIONS.get(trigger_type, TRIGGER_INSTRUCTIONS["conversation"])
     return THOUGHT_GENERATION_PROMPT.format(
         conversation_context=conversation_context,
         user_memories=user_memories,
         pending_thoughts=pending_thoughts,
         expressed_thoughts=expressed_thoughts,
         silence_duration=int(silence_duration),
-        internal_state=internal_state
+        internal_state=internal_state,
+        trigger_instruction=trigger_instruction
     )
 
 
@@ -422,11 +445,8 @@ def format_narrative_update_prompt(
     )
 
 
-def format_narrative_consolidation_prompt(entries: str) -> str:
-    return NARRATIVE_CONSOLIDATION_PROMPT.format(
-        entries=entries,
-        max_entries=config.NARRATIVE_MAX_ENTRIES // 2
-    )
+def format_session_summary_prompt(user_id: str, conversation: str) -> str:
+    return SESSION_SUMMARY_PROMPT.format(user_id=user_id, conversation=conversation)
 
 
 # =============================================================================
