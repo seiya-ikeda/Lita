@@ -218,10 +218,6 @@ class ProactiveAISlackBot:
                     text=response
                 )
 
-            # 定期的に記憶を抽出（5ターンごと）
-            if len(memory.short_term) >= 5 and len(memory.short_term) % 5 <= 1:
-                await self._extract_and_save_memories(memory)
-
             # 内部状態更新（5ターンごと）
             if len(memory.short_term) >= config.INTERNAL_STATE_UPDATE_INTERVAL and \
                len(memory.short_term) % config.INTERNAL_STATE_UPDATE_INTERVAL <= 1:
@@ -349,6 +345,8 @@ class ProactiveAISlackBot:
                         continue
                     # セッションサマリーをlong_termへ
                     await self.engine.summarize_session(memory)
+                    # 長期記憶の抽出（セッション全体を対象）
+                    await self._extract_and_save_memories(memory)
                     # ナラティブ・ユーザーモデル更新
                     entry = await self.engine.update_self_narrative(memory, self.narrative)
                     if entry:
