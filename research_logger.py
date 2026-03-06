@@ -255,7 +255,7 @@ class ResearchLogger:
         """セッション終了時に指標を保存"""
         metrics = self.calculate_metrics(user_id)
         
-        metrics_file = f"{self.log_dir}/metrics/sessions.csv"
+        metrics_file = f"{self.log_dir}/metrics/{user_id}_sessions.csv"
         file_exists = os.path.exists(metrics_file)
         
         with open(metrics_file, "a", newline="", encoding="utf-8") as f:
@@ -301,7 +301,8 @@ class ResearchLogger:
     def _append_to_csv(self, log_type: str, log_entry):
         """CSVにログを追記"""
         date_str = datetime.now().strftime("%Y-%m-%d")
-        filename = f"{self.log_dir}/{log_type}/{date_str}_{self.session_id}.csv"
+        user_id = log_entry.user_id
+        filename = f"{self.log_dir}/{log_type}/{date_str}_{user_id}_{self.session_id}.csv"
         
         file_exists = os.path.exists(filename)
         data = asdict(log_entry)
