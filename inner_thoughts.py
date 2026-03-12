@@ -6,8 +6,11 @@ Proactive AI Friend - Inner Thoughts Engine
 import json
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional
 from openai import AsyncOpenAI
+
+JST = ZoneInfo("Asia/Tokyo")
 
 import config
 import prompts
@@ -75,32 +78,35 @@ class InnerThoughtsEngine:
             expressed_thoughts=expressed_thoughts,
             silence_duration=memory.get_silence_duration(),
             internal_state=memory.internal_state.get_prompt_context(),
-            trigger_type=trigger_type
+            trigger_type=trigger_type,
+            recent_thought_types=memory.get_recent_thought_types()
         )
         
         try:
             response = await self.client.chat.completions.create(
                 model=config.LLM_MODEL,
-                temperature=config.LLM_TEMPERATURE,
+                temperature=config.LLM_THOUGHT_TEMPERATURE,
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS,
                 messages=[{"role": "user", "content": prompt}]
             )
-            
+
             # JSON抽出
             result = self._extract_json(response.choices[0].message.content)
             if not result:
                 return None
-            
+
             # 思考オブジェクト作成（まだ評価前なのでスコアは0）
             thought_content = result.get("thought", "")
+            thought_type = result.get("type", "")
             potential_response = result.get("potential_response", thought_content)
-            
+
             return Thought(
                 content=thought_content,
                 motivation_score=0,  # 評価で更新
                 reasoning="",
                 timestamp="",
-                triggered_by=trigger_reason
+                triggered_by=trigger_reason,
+                thought_type=thought_type
             ), potential_response
             
         except Exception as e:
@@ -165,16 +171,20 @@ class InnerThoughtsEngine:
         potential_response: str,
         memory: MemoryManager,
         trigger_reason: str,
-        narrative: Optional[SelfNarrative] = None
+        narrative: Optional[SelfNarrative] = None,
+        trigger_type: str = "conversation"
     ) -> str:
         """
         自発的な発言を生成
         """
+        current_time = datetime.now(JST).replace(tzinfo=None).strftime("%Y年%m月%d日 %H:%M (%A)")
         system_prompt = prompts.format_proactive_system_prompt(
             thought=potential_response,
             user_memories=memory.get_all_memories_summary(),
             silence_duration=memory.get_silence_duration(),
             trigger_reason=trigger_reason,
+            current_time=current_time,
+            trigger_type=trigger_type,
             self_narrative=narrative.get_summary() if narrative else "なし",
             user_model=memory.get_user_model_summary()
         )
@@ -210,7 +220,7 @@ class InnerThoughtsEngine:
             user_memories=memory.get_all_memories_summary(),
             self_narrative=narrative.get_summary() if narrative else "なし",
             user_model=memory.get_user_model_summary(),
-            current_time=datetime.now().strftime("%Y年%m月%d日 %H:%M (%A)"),
+            current_time=datetime.now(JST).replace(tzinfo=None).strftime("%Y年%m月%d日 %H:%M (%A)"),
             internal_state=memory.internal_state.get_prompt_context()
         )
         
@@ -427,7 +437,7 @@ class InnerThoughtsEngine:
             if not summary:
                 return False
 
-            date_str = datetime.now().strftime("%Y-%m-%d")
+            date_str = datetime.now(JST).replace(tzinfo=None).strftime("%Y-%m-%d")
             memory.add_long_term_memory(
                 key=f"session_summary_{date_str}",
                 content=summary,
@@ -484,6 +494,67 @@ class InnerThoughtsEngine:
     # メインの処理フロー
     # =========================================================================
 
+    async def process_info_share_cycle(
+        self,
+        article,  # information_gatherer.Article
+        memory: MemoryManager,
+        narrative: Optional[SelfNarrative] = None
+    ) -> Optional[dict]:
+        """
+        情報共有サイクル：記事を思考として扱い、モチベ評価 → 自発的発言を生成
+
+        Returns:
+            {"response": str, "thought_content": str, ...} または None
+        """
+        if not memory.can_intervene():
+            return None
+
+        trigger_type = "info_share"
+        silence = memory.get_silence_duration()
+        trigger_reason = f"info_share ({int(silence)}s since last message)"
+
+        # 記事を「思考」として構成
+        thought_content = (
+            f"ユーザーが「{article.search_query}」に興味があると記憶している。"
+            f"最近こんな記事を見つけた：{article.title}。{article.description[:80]}"
+        )
+        potential_response = (
+            f"そういえば、{article.title}って記事見つけてさ。{article.url}"
+        )
+
+        # 動機づけ評価（通常のproactiveと同じブレーキをかける）
+        evaluation = await self.evaluate_motivation(thought_content, memory, potential_response)
+
+        # 思考をリザーバーに保存
+        motivation_score = evaluation.get("overall_score", 0)
+        reservoir_thought = memory.add_thought(
+            content=thought_content,
+            motivation_score=motivation_score,
+            reasoning=evaluation.get("reasoning", ""),
+            triggered_by=trigger_reason
+        )
+
+        was_expressed = False
+        response = None
+        if motivation_score >= config.MOTIVATION_THRESHOLD and evaluation.get("should_speak", False):
+            response = await self.generate_proactive_response(
+                reservoir_thought, potential_response, memory, trigger_reason, narrative,
+                trigger_type=trigger_type
+            )
+            if response:
+                reservoir_thought.expressed = True
+                was_expressed = True
+
+        return {
+            "response": response,
+            "thought_content": thought_content,
+            "trigger_reason": trigger_reason,
+            "trigger_type": trigger_type,
+            "motivation_score": motivation_score,
+            "evaluation": evaluation,
+            "was_expressed": was_expressed,
+        }
+
     async def process_proactive_cycle(self, memory: MemoryManager, narrative: Optional[SelfNarrative] = None, trigger_type: str = "conversation") -> Optional[dict]:
         """
         Proactiveサイクルの実行：思考生成 → ブレーキ評価 → 発話
@@ -517,7 +588,8 @@ class InnerThoughtsEngine:
             content=thought.content,
             motivation_score=thought.motivation_score,
             reasoning=thought.reasoning,
-            triggered_by=trigger_reason
+            triggered_by=trigger_reason,
+            thought_type=thought.thought_type
         )
 
         # 閾値チェック
@@ -527,7 +599,8 @@ class InnerThoughtsEngine:
             if evaluation.get("should_speak", False):
                 # 発言生成
                 response = await self.generate_proactive_response(
-                    thought, potential_response, memory, trigger_reason, narrative
+                    thought, potential_response, memory, trigger_reason, narrative,
+                    trigger_type=trigger_type
                 )
                 if response:
                     reservoir_thought.expressed = True

@@ -6,9 +6,16 @@ Proactive AI Friend - Information Gatherer
 import aiohttp
 import json
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 from dataclasses import dataclass, asdict
 from openai import AsyncOpenAI
+
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST).replace(tzinfo=None)
 
 import config
 from memory import MemoryManager
@@ -189,7 +196,7 @@ class InformationGatherer:
                     source=result.get("meta_url", {}).get("hostname", ""),
                     published=result.get("age", None),
                     search_query=interest,
-                    found_at=datetime.now().isoformat()
+                    found_at=now_jst().isoformat()
                 )
                 articles.append(article)
         
@@ -326,51 +333,66 @@ URL: {article.url}
     # メインフロー
     # =========================================================================
     
-    async def find_shareable_article(
-        self, 
+    async def find_best_article(
+        self,
         memory: MemoryManager
-    ) -> Optional[tuple[Article, str]]:
+    ) -> Optional[Article]:
         """
-        共有すべき記事を探し、メッセージを生成
-        
+        最も関連性の高い記事を探して返す（スコアリングのみ。メッセージ生成はしない）
+
         Returns:
-            (Article, share_message) or None
+            Article or None
         """
         user_id = memory.user_id
-        
+
         # 1日の共有制限チェック
         if not self._can_share_today(user_id):
             return None
-        
+
         # 記事を検索
         articles = await self.search_for_user(memory)
-        
+
         if not articles:
             return None
-        
-        # 各記事を評価
+
+        # 各記事を評価（スコア3以上を候補とする）
         best_article = None
         best_score = 0
-        
+
         for article in articles:
             score = await self.evaluate_article_relevance(article, memory)
             article.relevance_score = score
-            
-            if score > best_score and score >= config.INFO_SHARE_MOTIVATION_THRESHOLD:
+
+            if score > best_score and score >= 3:
                 best_score = score
                 best_article = article
-        
-        if not best_article:
+
+        return best_article
+
+    def mark_article_shared(self, article: Article, user_id: str):
+        """記事を共有済みにマークし、カウントを増やす"""
+        article.shared = True
+        self._increment_daily_shares(user_id)
+
+    async def find_shareable_article(
+        self,
+        memory: MemoryManager
+    ) -> Optional[tuple[Article, str]]:
+        """
+        共有すべき記事を探し、メッセージを生成（後方互換用。discord_botから呼ばれる）
+
+        Returns:
+            (Article, share_message) or None
+        """
+        article = await self.find_best_article(memory)
+        if not article:
             return None
-        
-        # メッセージ生成
-        message = await self.generate_share_message(best_article, memory)
-        
+
+        message = await self.generate_share_message(article, memory)
         if message:
-            best_article.shared = True
-            self._increment_daily_shares(user_id)
-            return (best_article, message)
-        
+            self.mark_article_shared(article, memory.user_id)
+            return (article, message)
+
         return None
     
     # =========================================================================
@@ -379,7 +401,7 @@ URL: {article.url}
     
     def _can_share_today(self, user_id: str) -> bool:
         """今日まだ共有できるかチェック"""
-        now = datetime.now()
+        now = now_jst()
         
         # 日付が変わっていたらリセット
         if user_id in self.last_share_reset:

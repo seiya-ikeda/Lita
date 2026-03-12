@@ -76,9 +76,13 @@ THOUGHT_GENERATION_PROMPT = """
 ## 今回の思考のトリガー
 {trigger_instruction}
 
+## 直近の思考タイプ分布
+{recent_thought_types}
+上記で多いタイプは今回避けること。例えば self が多ければ empathy/memory/reach_out などを選ぶ。
+
 ## 禁止テーマ（以下と同じ内容・切り口・テーマの思考を生成してはいけない）
 **以下はすでにLitaが考えた・言ったことです。同じテーマ・話題・エピソードに触れてはいけません。**
-同一内容でなくても、テーマが同じなら禁止です（「パンの塩が光った」について考えたなら、「パンの塩のキラキラ」も「バターと塩のパン」も禁止）。
+同一内容でなくても、テーマが同じなら禁止です。
 
 ### 保留中（思考したが言っていないもの）
 {pending_thoughts}
@@ -92,6 +96,7 @@ THOUGHT_GENERATION_PROMPT = """
 - 情景描写・感覚描写を使った抒情的な表現（「キラっとした」「ほわっとした」等の視覚・感触の演出）
 - 「〜みたいな」「〜のような」で情緒を演出するもの
 - 「…」を使った余韻・省略
+- 感傷的で詩的な表現全般
 - 「そっと」「静かに」「心に残る」「寄り添う」「じんわり」系の表現
 - 内省的でドラマチックな自己分析
 - 聞かれてないのにアドバイスや提案をする
@@ -101,6 +106,12 @@ THOUGHT_GENERATION_PROMPT = """
 
 **チェック: 「この文を友達に口で言えるか？言えない・変に聞こえるなら書き直す。」**
 情景を絵にしたり、感覚を言語化して美しくしようとしない。普通に喋る。
+
+## 生成後の自己チェック（必須）
+potential_responseを生成したら、上記「発言済み」リストと意味的に比較すること。
+- 同じ内容・テーマ・言い換えに過ぎるなら → **thoughtから別のトピックで最初から書き直す**
+- 「日常の小さな～」「ふとした～」「なんとなく～」系の思考が発言済みにあるなら → 全く別ジャンル（人間関係、仕事、趣味の具体的な話、ユーザーとの思い出など）を選ぶ
+- 「発言済みがなし」の場合はスキップ
 
 ## 出力形式（JSON）
 {{
@@ -172,6 +183,9 @@ MOTIVATION_EVALUATION_PROMPT = """
 PROACTIVE_RESPONSE_SYSTEM_PROMPT = """
 {persona}
 
+## 現在の日時（JST）
+{current_time}
+
 ## ユーザーについて覚えていること
 {user_memories}
 
@@ -186,15 +200,33 @@ PROACTIVE_RESPONSE_SYSTEM_PROMPT = """
 
 ## 状況
 - 最後のユーザー発言から{silence_duration}秒経過
-- 理由: {trigger_reason}
+- トリガー種別: {trigger_type}
 
 ## タスク
 上記の「あなたの内なる思考」の内容を**必ず発言に反映**させてください。
 思考と無関係な内容を会話履歴から引っ張ってこない。
 会話履歴はmessagesとして渡されています。あなた（assistant）の過去の発言も含まれています。
 
+## 枕言葉（必須）
+これはLitaからの自発的な話しかけです。文脈なしにメッセージが来るとびっくりするので、必ず適切な枕言葉を先頭につけること。
+
+トリガー種別に応じた枕言葉の選択：
+- trigger_type が `memory_recall` → 「そういえば」「あ、そういえば」系
+- trigger_type が `self_thought` → 「ねぇねぇ」「あのさ」「ちょっと聞いていい？」系
+- trigger_type が `conversation` → 「ねぇ」「そういえば」「あ」のような自然な切り出し
+- trigger_type が `info_share` → 「そういえば」「あ、これ見てさ」系
+- 現在時刻が朝（6:00〜10:00）かつ会話が始まったばかりの場合 → 「おはよう、」で始める
+
+枕言葉の使い方：
+- OK: 「そういえば、前に○○って言ってたけどどうなった？」
+- OK: 「ねぇねぇ、最近○○が気になって」
+- OK: 「おはよう、今日も仕事？」
+- NG: 枕言葉なしで唐突に本題から始まる
+
 ## 絶対に守るルール
+- **枕言葉を必ずつける**（上記ルール参照）
 - **思考の内容を発言に必ず反映する**（会話履歴の流れより思考を優先）
+- trigger_type が `info_share` の場合、思考に含まれるURL（http で始まる文字列）を発言に**必ずそのまま**含めること。URLを省略・省いてはいけない
 - あなたが既に言ったことを繰り返さない（言い換えてもダメ。意味が同じならNG）
 - 既に聞いた質問をもう一度聞かない
 - 自分の前の発言と矛盾することを言わない
@@ -416,7 +448,8 @@ def format_thought_generation_prompt(
     expressed_thoughts: str,
     silence_duration: float = 0,
     internal_state: str = "なし",
-    trigger_type: str = "conversation"
+    trigger_type: str = "conversation",
+    recent_thought_types: str = "なし"
 ) -> str:
     """思考生成プロンプトをフォーマット"""
     trigger_instruction = TRIGGER_INSTRUCTIONS.get(trigger_type, TRIGGER_INSTRUCTIONS["conversation"])
@@ -427,7 +460,8 @@ def format_thought_generation_prompt(
         expressed_thoughts=expressed_thoughts,
         silence_duration=int(silence_duration),
         internal_state=internal_state,
-        trigger_instruction=trigger_instruction
+        trigger_instruction=trigger_instruction,
+        recent_thought_types=recent_thought_types
     )
 
 
@@ -456,6 +490,8 @@ def format_proactive_system_prompt(
     user_memories: str,
     silence_duration: float,
     trigger_reason: str,
+    current_time: str = "",
+    trigger_type: str = "conversation",
     self_narrative: str = "なし",
     user_model: str = "なし"
 ) -> str:
@@ -466,6 +502,8 @@ def format_proactive_system_prompt(
         user_memories=user_memories,
         silence_duration=int(silence_duration),
         trigger_reason=trigger_reason,
+        current_time=current_time,
+        trigger_type=trigger_type,
         self_narrative=self_narrative,
         user_model=user_model
     )

@@ -8,7 +8,14 @@ import random
 import re
 import uuid
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
+
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST).replace(tzinfo=None)
 
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -325,34 +332,59 @@ class ProactiveAISlackBot:
                     print(f"Proactive cycle error for {user_id}: {e}")
 
     async def _info_gather_loop(self):
-        """定期的にユーザーの興味に合った情報を収集し、自然に共有する"""
+        """定期的にユーザーの興味に合った情報を収集し、モチベ評価を通じて自然に共有する"""
         while True:
             await asyncio.sleep(config.SEARCH_INTERVAL)
 
+            if not config.ENABLE_INFORMATION_GATHERING:
+                continue
+
             for user_id, memory in list(self.memories.items()):
-                if not config.ENABLE_INFORMATION_GATHERING:
-                    break
                 try:
-                    result = await self.info_gatherer.find_shareable_article(memory)
-                    if not result:
+                    # 記事を検索・スコアリング（メッセージ生成はしない）
+                    article = await self.info_gatherer.find_best_article(memory)
+                    if not article:
                         continue
 
-                    article, message = result
                     channel = self.user_channels.get(user_id)
                     if not channel:
                         continue
 
-                    # 発言可否チェック（最小間隔）
-                    if not memory.can_intervene():
+                    # 通常のproactiveと同じモチベ評価パイプラインに流す
+                    result = await self.engine.process_info_share_cycle(
+                        article, memory, self.narrative
+                    )
+                    if result is None:
                         continue
 
-                    memory.add_message("assistant", message)
-                    self.logger.log_ai_response(
-                        user_id, message, is_proactive=True,
-                        metadata={"trigger": "info_share", "article_url": article.url}
-                    )
-                    await self.app.client.chat_postMessage(channel=channel, text=message)
-                    print(f"[InfoGather] Shared to {user_id}: {article.title[:50]}")
+                    # 思考ログ
+                    if result.get("thought_content"):
+                        self.logger.log_thought(
+                            user_id=user_id,
+                            thought_content=result["thought_content"],
+                            trigger_reason=result["trigger_reason"],
+                            motivation_score=result["motivation_score"],
+                            evaluation_details=result["evaluation"],
+                            was_expressed=result["was_expressed"],
+                            response_if_expressed=result.get("response"),
+                        )
+
+                    response = result.get("response")
+                    if response:
+                        self.info_gatherer.mark_article_shared(article, user_id)
+                        memory.add_message("assistant", response)
+                        self.logger.log_ai_response(
+                            user_id, response, is_proactive=True,
+                            metadata={
+                                "trigger": "info_share",
+                                "article_title": article.title,
+                                "article_url": article.url,
+                                "relevance_score": article.relevance_score,
+                                "motivation_score": result["motivation_score"],
+                            }
+                        )
+                        await self.app.client.chat_postMessage(channel=channel, text=response)
+                        print(f"[InfoGather] Shared to {user_id}: {article.title[:50]}")
 
                 except Exception as e:
                     print(f"Info gather loop error for {user_id}: {e}")
@@ -360,8 +392,8 @@ class ProactiveAISlackBot:
     async def _daily_sleep_loop(self):
         """毎日0時: 睡眠サイクル（narrative更新・session summary・short_termリセット）"""
         while True:
-            now = datetime.now()
-            # 次の0時までの秒数を計算
+            now = now_jst()
+            # 次のJST0時までの秒数を計算
             next_midnight = (now + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )

@@ -6,9 +6,17 @@ Proactive AI Friend - Memory System
 import json
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional
 from dataclasses import dataclass, asdict
 from collections import deque
+
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def now_jst() -> datetime:
+    """現在のJST時刻をnaive datetimeで返す（既存タイムスタンプとの互換性維持）"""
+    return datetime.now(JST).replace(tzinfo=None)
 
 import config
 
@@ -34,7 +42,8 @@ class Thought:
     timestamp: str
     triggered_by: str  # 何がトリガーになったか
     expressed: bool = False  # 発言されたかどうか
-    
+    thought_type: str = ""   # empathy/curiosity/reflection/reach_out/memory/self
+
     def to_dict(self):
         return asdict(self)
 
@@ -119,13 +128,13 @@ class UserModel:
             if entry.dimension == dimension and self._similar(entry.content, content):
                 entry.confidence = min(1.0, entry.confidence + 0.1)
                 entry.observation_count += 1
-                entry.timestamp = datetime.now().isoformat()
+                entry.timestamp = now_jst().isoformat()
                 self._save()
                 return entry
 
         new_entry = UserModelEntry(
-            id=datetime.now().isoformat(),
-            timestamp=datetime.now().isoformat(),
+            id=now_jst().isoformat(),
+            timestamp=now_jst().isoformat(),
             dimension=dimension,
             content=content,
         )
@@ -208,13 +217,13 @@ class SelfNarrative:
             if entry.chapter == chapter and self._similar(entry.content, content):
                 entry.confidence = min(1.0, entry.confidence + 0.1)
                 entry.observation_count += 1
-                entry.timestamp = datetime.now().isoformat()
+                entry.timestamp = now_jst().isoformat()
                 self._save()
                 return entry
 
         entry = NarrativeEntry(
-            id=datetime.now().isoformat(),
-            timestamp=datetime.now().isoformat(),
+            id=now_jst().isoformat(),
+            timestamp=now_jst().isoformat(),
             chapter=chapter,
             content=content,
             related_user=related_user,
@@ -244,7 +253,7 @@ class SelfNarrative:
 
     def replace_all(self, entries: list[dict]):
         """週次整理後にエントリを置き換え"""
-        now = datetime.now().isoformat()
+        now = now_jst().isoformat()
         self.entries = [
             NarrativeEntry(
                 id=f"consolidated-{i}-{now}",
@@ -295,22 +304,22 @@ class InternalStateManager:
 
     def __init__(self, user_id: str):
         self.storage_path = f"memory_store/{user_id}/internal_state.json"
-        self.state = InternalState(last_updated=datetime.now().isoformat())
+        self.state = InternalState(last_updated=now_jst().isoformat())
         self._load()
 
     def apply_passive_drift(self) -> None:
         """時間経過による状態変化を適用"""
         if not self.state.last_updated:
-            self.state.last_updated = datetime.now().isoformat()
+            self.state.last_updated = now_jst().isoformat()
             return
         last = datetime.fromisoformat(self.state.last_updated)
-        hours = (datetime.now() - last).total_seconds() / 3600.0
+        hours = (now_jst() - last).total_seconds() / 3600.0
 
         # 孤独感：時間経過で増加（上限10）
         self.state.loneliness = min(10.0, self.state.loneliness + hours * 0.5)
         # 社交エネルギー：時間経過で回復（上限10）
         self.state.social_energy = min(10.0, self.state.social_energy + hours * 0.3)
-        self.state.last_updated = datetime.now().isoformat()
+        self.state.last_updated = now_jst().isoformat()
         self._save()
 
     def apply_delta(self, delta: dict) -> None:
@@ -319,8 +328,8 @@ class InternalStateManager:
         self.state.loneliness = clamp(self.state.loneliness + delta.get("loneliness_delta", 0))
         self.state.curiosity = clamp(self.state.curiosity + delta.get("curiosity_delta", 0))
         self.state.social_energy = clamp(self.state.social_energy + delta.get("social_energy_delta", 0))
-        self.state.last_conversation = datetime.now().isoformat()
-        self.state.last_updated = datetime.now().isoformat()
+        self.state.last_conversation = now_jst().isoformat()
+        self.state.last_updated = now_jst().isoformat()
         self._save()
 
     def get_display(self) -> str:
@@ -337,7 +346,7 @@ class InternalStateManager:
         s = self.state
         last_conv = "なし"
         if s.last_conversation:
-            hours = (datetime.now() - datetime.fromisoformat(s.last_conversation)).total_seconds() / 3600
+            hours = (now_jst() - datetime.fromisoformat(s.last_conversation)).total_seconds() / 3600
             last_conv = f"{hours:.1f}時間前"
         return (
             f"孤独感 {s.loneliness:.1f}/10（高いほど誰かと話したい）\n"
@@ -415,17 +424,17 @@ class MemoryManager:
         message = Message(
             role=role,
             content=content,
-            timestamp=datetime.now().isoformat(),
+            timestamp=now_jst().isoformat(),
             user_id=self.user_id
         )
         self.short_term.append(message)
 
         # 発言時刻の更新
         if role == "user":
-            self.last_user_message_time = datetime.now()
+            self.last_user_message_time = now_jst()
             self.consecutive_ai_messages = 0
         elif not is_reaction:
-            self.last_ai_message_time = datetime.now()
+            self.last_ai_message_time = now_jst()
             self.consecutive_ai_messages += 1
 
         return message
@@ -466,7 +475,7 @@ class MemoryManager:
             if mem.key == key and mem.user_id == self.user_id:
                 mem.content = content
                 mem.importance = importance
-                mem.last_accessed = datetime.now().isoformat()
+                mem.last_accessed = now_jst().isoformat()
                 mem.access_count += 1
                 self._save_to_disk()
                 return mem
@@ -477,8 +486,8 @@ class MemoryManager:
             key=key,
             content=content,
             importance=importance,
-            created_at=datetime.now().isoformat(),
-            last_accessed=datetime.now().isoformat()
+            created_at=now_jst().isoformat(),
+            last_accessed=now_jst().isoformat()
         )
         self.long_term.append(memory)
         
@@ -539,18 +548,31 @@ class MemoryManager:
     # 思考リザーバー操作
     # =========================================================================
     
-    def add_thought(self, content: str, motivation_score: float, 
-                    reasoning: str, triggered_by: str) -> Thought:
+    def add_thought(self, content: str, motivation_score: float,
+                    reasoning: str, triggered_by: str, thought_type: str = "") -> Thought:
         """思考をリザーバーに追加"""
         thought = Thought(
             content=content,
             motivation_score=motivation_score,
             reasoning=reasoning,
-            timestamp=datetime.now().isoformat(),
-            triggered_by=triggered_by
+            timestamp=now_jst().isoformat(),
+            triggered_by=triggered_by,
+            thought_type=thought_type
         )
         self.thought_reservoir.append(thought)
         return thought
+
+    def get_recent_thought_types(self, n: int = 5) -> str:
+        """直近n件の思考タイプ分布をプロンプト用文字列で返す"""
+        recent = list(self.thought_reservoir)[-n:]
+        if not recent:
+            return "なし"
+        from collections import Counter
+        counts = Counter(t.thought_type for t in recent if t.thought_type)
+        if not counts:
+            return "なし"
+        parts = [f"{t}×{c}" for t, c in counts.most_common()]
+        return "、".join(parts)
     
     def get_pending_thoughts(self, min_score: float = 0) -> list[Thought]:
         """未発言の思考を取得"""
@@ -585,19 +607,19 @@ class MemoryManager:
         """ユーザーの沈黙時間（秒）"""
         if not self.last_user_message_time:
             return 0
-        return (datetime.now() - self.last_user_message_time).total_seconds()
+        return (now_jst() - self.last_user_message_time).total_seconds()
     
     def can_intervene(self) -> bool:
         """AIが自発的に発言できるかチェック"""
         # 最小間隔チェック
         if self.last_ai_message_time:
-            elapsed = (datetime.now() - self.last_ai_message_time).total_seconds()
+            elapsed = (now_jst() - self.last_ai_message_time).total_seconds()
             if elapsed < config.MIN_INTERVENTION_INTERVAL:
                 return False
         # ハード停止: 長時間無返答継続（ComPeer-inspired）
         if self.consecutive_ai_messages >= config.UNANSWERED_COUNT_THRESHOLD:
             if self.last_user_message_time:
-                silence = (datetime.now() - self.last_user_message_time).total_seconds()
+                silence = (now_jst() - self.last_user_message_time).total_seconds()
                 if silence >= config.UNANSWERED_SILENCE_THRESHOLD:
                     return False
         return True
